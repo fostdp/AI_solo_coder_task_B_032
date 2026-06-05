@@ -1,0 +1,113 @@
+<?xml version="1.0"?>
+<yandex>
+    <logger>
+        <level>information</level>
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+        <size>100M</size>
+        <count>10</count>
+    </logger>
+
+    <display_name>Battery Monitor ClickHouse</display_name>
+    <listen_host>0.0.0.0</listen_host>
+    <http_port>8123</http_port>
+    <tcp_port>9000</tcp_port>
+
+    <max_connections>4096</max_connections>
+    <keep_alive_timeout>3s</keep_alive_timeout>
+
+    <max_concurrent_queries>100</max_concurrent_queries>
+    <max_memory_usage>10G</max_memory_usage>
+    <max_memory_usage_for_user>8G</max_memory_usage_for_user>
+    <max_memory_usage_for_all_queries>8G</max_memory_usage_for_all_queries>
+
+    <mark_cache_size>5368709120</mark_cache_size>
+    <mmap_cache_size>1000</mmap_cache_size>
+
+    <merge_tree>
+        <max_suspicious_broken_parts>10</max_suspicious_broken_parts>
+        <parts_to_throw_insert>300</parts_to_throw_insert>
+        <parts_to_delay_insert>150</parts_to_delay_insert>
+        <max_number_of_merges_with_ttl_in_pool>2</max_number_of_merges_with_ttl_in_pool>
+
+        <index_granularity>8192</index_granularity>
+        <index_granularity_bytes>10485760</index_granularity_bytes>
+
+        <min_bytes_for_wide_part>10485760</min_bytes_for_wide_part>
+        <min_rows_for_wide_part>1048576</min_rows_for_wide_part>
+
+        <ttl_only_drop_parts>1</ttl_only_drop_parts>
+
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>8</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+
+        <max_replicated_merges_in_queue>16</max_replicated_merges_in_queue>
+        <max_replicated_sends_in_queue>16</max_replicated_sends_in_queue>
+
+        <max_bytes_to_merge_at_min_space_in_pool>10737418240</max_bytes_to_merge_at_min_space_in_pool>
+        <max_bytes_to_merge_at_max_space_in_pool>161061273600</max_bytes_to_merge_at_max_space_in_pool>
+    </merge_tree>
+
+    <compression>
+        <case>
+            <min_part_size>1073741824</min_part_size>
+            <min_part_size_ratio>0.01</min_part_size_ratio>
+            <method>zstd</method>
+            <level>1</level>
+        </case>
+        <case>
+            <method>LZ4</method>
+        </case>
+    </compression>
+
+    <timezone>Asia/Shanghai</timezone>
+
+    <log_queries>1</log_queries>
+    <log_query_threads>1</log_query_threads>
+
+    <profiles>
+        <default>
+            <max_memory_usage>10000000000</max_memory_usage>
+            <use_uncompressed_cache>0</use_uncompressed_cache>
+            <load_balancing>random</load_balancing>
+            <allow_experimental_map_type>1</allow_experimental_map_type>
+            <allow_experimental_geo_types>1</allow_experimental_geo_types>
+            <max_execution_time>600</max_execution_time>
+            <timeout_overflow_mode>break</timeout_overflow_mode>
+            <max_rows_to_read>0</max_rows_to_read>
+            <max_bytes_to_read>0</max_bytes_to_read>
+            <max_result_rows>0</max_result_rows>
+            <max_result_bytes>0</max_result_bytes>
+        </default>
+
+        <readonly>
+            <readonly>1</readonly>
+            <max_memory_usage>5000000000</max_memory_usage>
+            <max_execution_time>300</max_execution_time>
+        </readonly>
+    </profiles>
+
+    <users>
+        <default>
+            <password></password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </default>
+    </users>
+
+    <quotas>
+        <default>
+            <interval>
+                <duration>3600</duration>
+                <queries>0</queries>
+                <errors>0</errors>
+                <result_rows>0</result_rows>
+                <read_rows>0</read_rows>
+                <execution_time>0</execution_time>
+            </interval>
+        </default>
+    </quotas>
+</yandex>

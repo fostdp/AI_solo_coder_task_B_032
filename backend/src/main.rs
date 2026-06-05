@@ -6,6 +6,7 @@ mod config;
 mod data_pipeline;
 mod database;
 mod messages;
+mod metrics;
 mod models;
 mod mqtt_collector;
 mod stage_detector;
@@ -25,10 +26,14 @@ use crate::mqtt_collector::{DataReceiver, DataSender};
 use crate::mqtt_collector::MqttCollector;
 use crate::stage_detector::StageDetector;
 use anyhow::Result;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::compression::CompressionLayer;
+use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::fmt::format::FmtSpan;
 
 const CHANNEL_BUFFER_SIZE: usize = 1000;
 
@@ -36,10 +41,25 @@ const CHANNEL_BUFFER_SIZE: usize = 1000;
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(EnvFilter::from_default_env())
-        .with(fmt::layer())
+        .with(
+            fmt::layer()
+                .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true),
+        )
         .init();
 
-    info!("Starting Battery Monitor System (Modular Architecture)...");
+    info!("Starting Battery Monitor System v1.0.0 (Modular Architecture)...");
+
+    crate::metrics::init_metrics();
+    info!("Metrics system initialized");
+
+    let prometheus_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("Failed to install Prometheus recorder");
+    info!("Prometheus metrics recorder installed");
 
     let config = Config::load();
     info!("Configuration loaded");
@@ -175,6 +195,7 @@ async fn main() -> Result<()> {
         db: db.clone(),
         predictor: capacity_predictor,
         alert_manager: alarm_sender,
+        prometheus_handle: Arc::new(prometheus_handle),
     });
 
     let cors = CorsLayer::new()
@@ -182,7 +203,16 @@ async fn main() -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = create_router(api_state).layer(cors);
+    let compression = CompressionLayer::new().gzip(true).deflate(true).br(true);
+
+    let trace = TraceLayer::new_for_http()
+        .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO))
+        .on_response(tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO));
+
+    let app = create_router(api_state)
+        .layer(cors)
+        .layer(compression)
+        .layer(trace);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     info!("Starting HTTP server on {}", addr);
@@ -195,6 +225,8 @@ async fn main() -> Result<()> {
     info!("                    ┌──────────────────────┐      ┌───────────────────┐");
     info!("                    │ Capacity Predictor   │      │   Alarm Sender    │");
     info!("                    └──────────────────────┘      └───────────────────┘");
+    info!("");
+    info!("Prometheus metrics available at /metrics endpoint");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)

@@ -14,6 +14,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,11 +70,13 @@ pub struct ApiState {
     pub db: Database,
     pub predictor: CapacityPredictor,
     pub alert_manager: AlarmSender,
+    pub prometheus_handle: Arc<PrometheusHandle>,
 }
 
 pub fn create_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/api/health", get(health_check))
+        .route("/metrics", get(metrics_handler))
         .route("/api/cabinets", get(get_all_cabinets))
         .route("/api/cabinet/:id", get(get_cabinet_panel))
         .route("/api/cabinet/:id/status", get(get_cabinet_status))
@@ -98,6 +101,16 @@ async fn health_check() -> impl IntoResponse {
         })),
         message: None,
     })
+}
+
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("Content-Type", "text/plain; version=0.0.4; charset=utf-8")],
+        state.prometheus_handle.render(),
+    )
 }
 
 async fn get_all_cabinets(
