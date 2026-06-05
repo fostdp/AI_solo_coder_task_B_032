@@ -136,6 +136,21 @@
         </div>
     </div>
 
-    <script src="app.js"></script>
+    <script src="cabinet_panel.js"></script>
+    <script src="channel_detail.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            window.CabinetPanel.init();
+            window.ChannelDetail.init();
+        });
+
+        function refreshPanel() {
+            window.CabinetPanel.refresh();
+        }
+
+        function toggleAutoRefresh() {
+            window.CabinetPanel.toggleAutoRefresh();
+        }
+    </script>
 </body>
 </html>

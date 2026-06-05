@@ -1,5 +1,8 @@
 use crate::config::DetectionConfig;
 use crate::database::Database;
+use crate::messages::{
+    AnomalyEvent, AnomalySender, DataBatch, DataBatchReceiver, PauseCommand, PauseSender,
+};
 use crate::models::{
     Anomaly, AnomalyType, ChannelData, ChannelStatus, Severity, RATED_CAPACITY,
 };
@@ -14,6 +17,8 @@ pub struct AnomalyDetector {
     db: Database,
     recent_voltage_deviations: Arc<DashMap<(u16, u32), Vec<(chrono::DateTime<Utc>, f64)>>>,
     anomaly_cooldown: Arc<DashMap<(u16, u32, AnomalyType), chrono::DateTime<Utc>>>,
+    anomaly_sender: Option<AnomalySender>,
+    pause_sender: Option<PauseSender>,
 }
 
 impl AnomalyDetector {
@@ -23,7 +28,55 @@ impl AnomalyDetector {
             db,
             recent_voltage_deviations: Arc::new(DashMap::new()),
             anomaly_cooldown: Arc::new(DashMap::new()),
+            anomaly_sender: None,
+            pause_sender: None,
         }
+    }
+
+    pub fn with_channels(mut self, anomaly_sender: AnomalySender, pause_sender: PauseSender) -> Self {
+        self.anomaly_sender = Some(anomaly_sender);
+        self.pause_sender = Some(pause_sender);
+        self
+    }
+
+    pub async fn start(mut self, mut data_receiver: DataBatchReceiver) {
+        info!("Anomaly detector started");
+
+        while let Some(batch) = data_receiver.recv().await {
+            if let Err(e) = self.process_batch(&batch).await {
+                warn!("Anomaly detection error: {}", e);
+            }
+        }
+
+        warn!("Anomaly detector stopped");
+    }
+
+    async fn process_batch(&mut self, batch: &DataBatch) -> anyhow::Result<()> {
+        for data in &batch.data {
+            let anomalies = self.detect_anomalies(data).await;
+
+            for anomaly in anomalies {
+                let is_voltage_dev = matches!(anomaly.anomaly_type, AnomalyType::VoltageDeviation);
+
+                if let Some(sender) = &self.anomaly_sender {
+                    let event = AnomalyEvent {
+                        anomaly: anomaly.clone(),
+                        channel_data: data.clone(),
+                    };
+                    if let Err(e) = sender.send(event).await {
+                        warn!("Failed to send anomaly event: {}", e);
+                    }
+                }
+
+                if is_voltage_dev {
+                    self.handle_voltage_anomaly(data, &anomaly).await;
+                }
+            }
+
+            self.update_channel_status(data).await;
+        }
+
+        Ok(())
     }
 
     pub async fn detect_anomalies(&self, data: &ChannelData) -> Vec<Anomaly> {
@@ -51,8 +104,6 @@ impl AnomalyDetector {
                     warn!("Failed to insert anomaly: {}", e);
                 }
             }
-            
-            self.update_channel_status(data, &anomalies).await;
         }
 
         anomalies
@@ -145,10 +196,10 @@ impl AnomalyDetector {
 
     fn detect_capacity_low(&self, data: &ChannelData) -> Option<Anomaly> {
         let capacity_ratio = data.capacity / RATED_CAPACITY;
-        
+
         if capacity_ratio < self.config.capacity_warning_ratio {
             let anomaly_type = AnomalyType::CapacityLow;
-            
+
             if self.is_in_cooldown(data.cabinet_id, data.channel_id, anomaly_type) {
                 return None;
             }
@@ -185,7 +236,7 @@ impl AnomalyDetector {
     fn detect_temperature_high(&self, data: &ChannelData) -> Option<Anomaly> {
         if data.temperature > self.config.temperature_high_threshold {
             let anomaly_type = AnomalyType::TemperatureHigh;
-            
+
             if self.is_in_cooldown(data.cabinet_id, data.channel_id, anomaly_type) {
                 return None;
             }
@@ -219,10 +270,10 @@ impl AnomalyDetector {
 
     fn detect_current_abnormal(&self, data: &ChannelData) -> Option<Anomaly> {
         let abs_current = data.current.abs();
-        
+
         if abs_current > 2.0 || abs_current < -2.0 {
             let anomaly_type = AnomalyType::CurrentAbnormal;
-            
+
             if self.is_in_cooldown(data.cabinet_id, data.channel_id, anomaly_type) {
                 return None;
             }
@@ -251,12 +302,24 @@ impl AnomalyDetector {
         None
     }
 
-    async fn update_channel_status(&self, data: &ChannelData, anomalies: &[Anomaly]) {
-        let has_critical = anomalies.iter().any(|a| matches!(a.severity, Severity::Critical));
-        let has_voltage_dev = anomalies
-            .iter()
-            .any(|a| matches!(a.anomaly_type, AnomalyType::VoltageDeviation));
+    async fn handle_voltage_anomaly(&self, data: &ChannelData, _anomaly: &Anomaly) {
+        if let Some(sender) = &self.pause_sender {
+            let cmd = PauseCommand {
+                cabinet_id: data.cabinet_id,
+                channel_id: data.channel_id,
+                reason: "voltage_anomaly".to_string(),
+            };
+            if let Err(e) = sender.send(cmd).await {
+                warn!("Failed to send pause command: {}", e);
+            }
+        }
 
+        if let Err(e) = self.db.pause_channel(data.cabinet_id, data.channel_id).await {
+            warn!("Failed to pause channel in DB: {}", e);
+        }
+    }
+
+    async fn update_channel_status(&self, data: &ChannelData) {
         let status = ChannelStatus {
             cabinet_id: data.cabinet_id,
             channel_id: data.channel_id,
@@ -267,20 +330,16 @@ impl AnomalyDetector {
             current_temperature: data.temperature,
             current_capacity: data.capacity,
             cycle_index: data.cycle_index,
-            is_abnormal: !anomalies.is_empty(),
-            is_paused: has_voltage_dev,
+            is_abnormal: false,
+            is_paused: false,
             capacity_ratio: data.capacity / RATED_CAPACITY,
             predicted_capacity: 0.0,
+            prediction_status: crate::models::PredictionStatus::Pending,
+            completed_cycles: 0,
         };
 
         if let Err(e) = self.db.update_channel_status(&status).await {
             warn!("Failed to update channel status: {}", e);
-        }
-
-        if has_voltage_dev {
-            if let Err(e) = self.db.pause_channel(data.cabinet_id, data.channel_id).await {
-                warn!("Failed to pause channel: {}", e);
-            }
         }
     }
 

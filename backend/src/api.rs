@@ -1,10 +1,11 @@
-use crate::alert_manager::AlertManager;
+use crate::alarm_sender::AlarmSender;
+use crate::capacity_predictor::CapacityPredictor;
 use crate::database::Database;
+use crate::messages::PredictionRequest;
 use crate::models::{
     CabinetStats, ChannelHistory, ChannelStatus, CHANNELS_PER_CABINET, NUM_CABINETS,
     RATED_CAPACITY,
 };
-use crate::prediction::CapacityPredictor;
 use axum::{
     extract::{Path, Query},
     http::StatusCode,
@@ -67,7 +68,7 @@ pub struct ChannelDetailResponse {
 pub struct ApiState {
     pub db: Database,
     pub predictor: CapacityPredictor,
-    pub alert_manager: AlertManager,
+    pub alert_manager: AlarmSender,
 }
 
 pub fn create_router(state: Arc<ApiState>) -> Router {
@@ -458,11 +459,13 @@ async fn predict_capacity(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     Path((cabinet_id, channel_id)): Path<(u16, u32)>,
 ) -> impl IntoResponse {
-    match state
-        .predictor
-        .predict_capacity(cabinet_id, channel_id, 3)
-        .await
-    {
+    let request = PredictionRequest {
+        cabinet_id,
+        channel_id,
+        n_cycles: 3,
+    };
+
+    match state.predictor.predict_capacity(request).await {
         Some(prediction) => Json(ApiResponse {
             success: true,
             data: Some(prediction),

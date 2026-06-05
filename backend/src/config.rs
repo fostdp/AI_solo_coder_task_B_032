@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +9,32 @@ pub struct Config {
     pub server: ServerConfig,
     pub detection: DetectionConfig,
     pub alert: AlertConfig,
+    pub model: ModelConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub default_model: String,
+    pub models: HashMap<String, BatteryModelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatteryModelConfig {
+    pub description: String,
+    pub rated_capacity: f64,
+    pub feature_names: Vec<String>,
+    pub feature_weights: HashMap<String, f64>,
+    pub feature_ranges: HashMap<String, [f64; 2]>,
+    pub model_params: ModelParams,
+    pub min_cycles: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelParams {
+    pub num_trees: usize,
+    pub max_depth: usize,
+    pub learning_rate: f64,
+    pub min_samples_split: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +78,29 @@ pub struct AlertConfig {
     pub enable_mes_notification: bool,
     pub enable_screen_notification: bool,
     pub dedup_window_seconds: u64,
+}
+
+impl Config {
+    pub fn load() -> Self {
+        let mut config = Self::default();
+        if let Ok(model_config) = Self::load_model_config() {
+            config.model = model_config;
+        }
+        config
+    }
+
+    fn load_model_config() -> anyhow::Result<ModelConfig> {
+        let config_path = std::env::var("MODEL_CONFIG_PATH")
+            .unwrap_or_else(|_| "model_config.json".to_string());
+        let content = std::fs::read_to_string(&config_path)?;
+        let model_config: ModelConfig = serde_json::from_str(&content)?;
+        Ok(model_config)
+    }
+
+    pub fn get_model_config(&self, model_name: Option<&str>) -> Option<&BatteryModelConfig> {
+        let name = model_name.unwrap_or(&self.model.default_model);
+        self.model.models.get(name)
+    }
 }
 
 impl Default for Config {
@@ -135,6 +185,10 @@ impl Default for Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(300),
+            },
+            model: ModelConfig {
+                default_model: "NMC_3Ah".to_string(),
+                models: HashMap::new(),
             },
         }
     }

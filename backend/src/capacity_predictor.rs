@@ -1,8 +1,9 @@
 use crate::config::BatteryModelConfig;
 use crate::database::Database;
-use crate::models::{
-    ChannelStatus, CycleFeatures, PredictionResult, PredictionStatus, RATED_CAPACITY,
+use crate::messages::{
+    PredictionReceiver, PredictionRequest, PredictionResult, PredictionResultSender,
 };
+use crate::models::{CycleFeatures, PredictionStatus};
 use chrono::Utc;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -291,12 +292,14 @@ fn features_to_vec(features: &CycleFeatures, model_config: &BatteryModelConfig) 
     raw_vec
 }
 
+#[derive(Clone)]
 pub struct CapacityPredictor {
     db: Database,
     model_config: BatteryModelConfig,
     model: Arc<RwLock<GradientBoostingModel>>,
     training_data: Arc<RwLock<Vec<(Vec<f64>, f64)>>>,
     prediction_cache: Arc<RwLock<HashMap<(u16, u32, u16), f64>>>,
+    result_sender: Option<PredictionResultSender>,
 }
 
 impl CapacityPredictor {
@@ -313,7 +316,13 @@ impl CapacityPredictor {
             model: Arc::new(RwLock::new(model)),
             training_data: Arc::new(RwLock::new(Vec::new())),
             prediction_cache: Arc::new(RwLock::new(HashMap::new())),
+            result_sender: None,
         }
+    }
+
+    pub fn with_result_sender(mut self, sender: PredictionResultSender) -> Self {
+        self.result_sender = Some(sender);
+        self
     }
 
     fn initialize_pretrained_model(model: &mut GradientBoostingModel, config: &BatteryModelConfig) {
@@ -329,38 +338,33 @@ impl CapacityPredictor {
         self.model_config.min_cycles
     }
 
-    pub async fn add_training_sample(&self, features: &CycleFeatures, actual_capacity: f64) {
-        let x = features_to_vec(features, &self.model_config);
-        let mut training_data = self.training_data.write().await;
-        training_data.push((x, actual_capacity));
+    pub async fn start(mut self, mut request_receiver: PredictionReceiver) {
+        info!(
+            "Capacity predictor started, model: {}, min_cycles: {}",
+            self.model_config.description, self.model_config.min_cycles
+        );
 
-        if training_data.len() >= 1000 {
-            let X: Vec<Vec<f64>> = training_data.iter().map(|(x, _)| x.clone()).collect();
-            let y: Vec<f64> = training_data.iter().map(|(_, y)| *y).collect();
-
-            let mut model = self.model.write().await;
-            model.fit(&X, &y, &self.model_config.model_params);
-            model.trained_at = Utc::now();
-            model.n_samples = training_data.len();
-
-            info!(
-                "Model retrained with {} samples, trees: {}, model: {}",
-                training_data.len(),
-                model.trees.len(),
-                model.model_name
-            );
-
-            training_data.clear();
+        while let Some(request) = request_receiver.recv().await {
+            if let Some(result) = self.predict_capacity(request).await {
+                if let Some(sender) = &self.result_sender {
+                    if let Err(e) = sender.send(result.clone()).await {
+                        warn!("Failed to send prediction result: {}", e);
+                    }
+                }
+            }
         }
+
+        warn!("Capacity predictor stopped");
     }
 
     pub async fn predict_capacity(
         &self,
-        cabinet_id: u16,
-        channel_id: u32,
-        n_cycles: usize,
+        request: PredictionRequest,
     ) -> Option<PredictionResult> {
         let min_cycles = self.model_config.min_cycles;
+        let cabinet_id = request.cabinet_id;
+        let channel_id = request.channel_id;
+        let n_cycles = request.n_cycles;
 
         let features_result = self
             .db
@@ -575,6 +579,31 @@ impl CapacityPredictor {
             self.db.update_channel_status(&status).await?;
         }
         Ok(())
+    }
+
+    pub async fn add_training_sample(&self, features: &CycleFeatures, actual_capacity: f64) {
+        let x = features_to_vec(features, &self.model_config);
+        let mut training_data = self.training_data.write().await;
+        training_data.push((x, actual_capacity));
+
+        if training_data.len() >= 1000 {
+            let X: Vec<Vec<f64>> = training_data.iter().map(|(x, _)| x.clone()).collect();
+            let y: Vec<f64> = training_data.iter().map(|(_, y)| *y).collect();
+
+            let mut model = self.model.write().await;
+            model.fit(&X, &y, &self.model_config.model_params);
+            model.trained_at = Utc::now();
+            model.n_samples = training_data.len();
+
+            info!(
+                "Model retrained with {} samples, trees: {}, model: {}",
+                training_data.len(),
+                model.trees.len(),
+                model.model_name
+            );
+
+            training_data.clear();
+        }
     }
 
     pub async fn get_prediction(
