@@ -544,6 +544,22 @@ body {
     transition: width 0.3s;
 }
 
+.prediction-item .value.neutral {
+    color: #6b7280;
+}
+
+.prediction-item .value.warning {
+    color: #f59e0b;
+}
+
+.prediction-item .value.good {
+    color: #10b981;
+}
+
+.prediction-item .value.danger {
+    color: #ef4444;
+}
+
 .modal-actions {
     display: flex;
     justify-content: flex-end;

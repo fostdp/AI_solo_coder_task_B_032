@@ -59,6 +59,15 @@ pub enum AlertLevel {
     Level2 = 2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum PredictionStatus {
+    Pending = 0,
+    Predicting = 1,
+    Completed = 2,
+    InsufficientData = 3,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
 pub struct ChannelData {
     pub timestamp: DateTime<Utc>,
@@ -88,6 +97,8 @@ pub struct ChannelStatus {
     pub is_paused: bool,
     pub capacity_ratio: f64,
     pub predicted_capacity: f64,
+    pub prediction_status: PredictionStatus,
+    pub completed_cycles: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
@@ -120,6 +131,8 @@ pub struct PredictionResult {
     pub rated_capacity: f64,
     pub prediction_error: Option<f64>,
     pub model_version: String,
+    pub status: PredictionStatus,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]

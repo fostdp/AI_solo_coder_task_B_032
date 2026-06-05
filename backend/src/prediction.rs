@@ -332,64 +332,195 @@ impl CapacityPredictor {
         channel_id: u32,
         n_cycles: usize,
     ) -> Option<PredictionResult> {
-        let features = self
+        use crate::models::PredictionStatus;
+
+        let min_cycles = 3;
+
+        let features_result = self
             .db
             .get_recent_cycle_features(cabinet_id, channel_id, n_cycles)
-            .await
-            .ok()?;
+            .await;
 
-        if features.len() < 3 {
-            debug!(
-                "Not enough cycles for prediction: cabinet={}, channel={}, cycles={}",
-                cabinet_id,
-                channel_id,
-                features.len()
-            );
-            return None;
-        }
+        let (status, message, maybe_predicted) = match features_result {
+            Ok(features) => {
+                if features.len() < min_cycles {
+                    let msg = format!(
+                        "循环数不足: 已完成 {} 个循环, 需要 {} 个完整循环",
+                        features.len(),
+                        min_cycles
+                    );
+                    debug!(
+                        "Insufficient cycles for prediction: cabinet={}, channel={}, completed={}, required={}",
+                        cabinet_id, channel_id, features.len(), min_cycles
+                    );
+                    (PredictionStatus::InsufficientData, msg, None)
+                } else {
+                    match Self::validate_cycle_features(&features) {
+                        Ok(_) => {
+                            let averaged_features = self.average_features(&features);
+                            let x = features_to_vec(&averaged_features);
 
-        let averaged_features = self.average_features(&features);
-        let x = features_to_vec(&averaged_features);
+                            let model = self.model.read().await;
+                            let predicted = model.predict(&x);
+                            let predicted = predicted.max(0.0).min(RATED_CAPACITY * 1.2);
 
-        let model = self.model.read().await;
-        let predicted = model.predict(&x);
-        let predicted = predicted.max(0.0).min(RATED_CAPACITY * 1.2);
+                            (
+                                PredictionStatus::Completed,
+                                format!("预测完成，基于 {} 个循环特征", features.len()),
+                                Some((predicted, features.clone())),
+                            )
+                        }
+                        Err(validation_msg) => {
+                            let msg = format!("循环数据不完整: {}", validation_msg);
+                            debug!(
+                                "Invalid cycle features for cabinet={}, channel={}: {}",
+                                cabinet_id, channel_id, validation_msg
+                            );
+                            (PredictionStatus::InsufficientData, msg, None)
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = format!("查询特征数据失败: {}", e);
+                warn!(
+                    "Failed to get cycle features for cabinet={}, channel={}: {}",
+                    cabinet_id, channel_id, e
+                );
+                (PredictionStatus::InsufficientData, msg, None)
+            }
+        };
 
-        let current_cycle = features.last().unwrap().cycle_index;
-        let cycle_index = current_cycle + 1;
+        let (predicted_capacity, cycle_index) = if let Some((predicted, features)) = maybe_predicted
+        {
+            let current_cycle = features.last().unwrap().cycle_index;
+            let cycle_idx = current_cycle + 1;
 
-        let cache_key = (cabinet_id, channel_id, cycle_index);
-        self.prediction_cache
-            .write()
-            .await
-            .insert(cache_key, predicted);
+            let cache_key = (cabinet_id, channel_id, cycle_idx);
+            self.prediction_cache
+                .write()
+                .await
+                .insert(cache_key, predicted);
+
+            (predicted, cycle_idx)
+        } else {
+            (0.0, 0)
+        };
 
         let result = PredictionResult {
             timestamp: Utc::now(),
             cabinet_id,
             channel_id,
             cycle_index,
-            predicted_capacity: predicted,
+            predicted_capacity,
             actual_capacity: None,
             rated_capacity: RATED_CAPACITY,
             prediction_error: None,
             model_version: MODEL_VERSION.to_string(),
+            status,
+            message: message.clone(),
         };
 
         if let Err(e) = self.db.insert_prediction(&result).await {
             warn!("Failed to insert prediction: {}", e);
         }
 
-        if let Err(e) = self.update_channel_prediction(cabinet_id, channel_id, predicted).await {
-            warn!("Failed to update channel prediction: {}", e);
+        if matches!(status, PredictionStatus::Completed) {
+            if let Err(e) = self
+                .update_channel_prediction(cabinet_id, channel_id, predicted_capacity)
+                .await
+            {
+                warn!("Failed to update channel prediction: {}", e);
+            }
+
+            info!(
+                "Prediction completed: cabinet={}, channel={}, cycle={}, predicted={:.4}",
+                cabinet_id, channel_id, cycle_index, predicted_capacity
+            );
+        } else {
+            debug!(
+                "Prediction pending for cabinet={}, channel={}: {}",
+                cabinet_id, channel_id, message
+            );
+
+            if let Some(mut channel_status) = self
+                .db
+                .get_channel_status(cabinet_id, channel_id)
+                .await
+                .ok()
+                .flatten()
+            {
+                channel_status.prediction_status = status;
+                channel_status.predicted_capacity = 0.0;
+                let _ = self.db.update_channel_status(&channel_status).await;
+            }
         }
 
-        info!(
-            "Prediction: cabinet={}, channel={}, cycle={}, predicted={:.4}",
-            cabinet_id, channel_id, cycle_index, predicted
-        );
-
         Some(result)
+    }
+
+    fn validate_cycle_features(features: &[crate::models::CycleFeatures]) -> Result<(), String> {
+        for (i, f) in features.iter().enumerate() {
+            if f.cc_charge_time < 60 {
+                return Err(format!(
+                    "第 {} 个循环恒流充电时间过短 ({}s < 60s)",
+                    i + 1,
+                    f.cc_charge_time
+                ));
+            }
+            if f.cv_charge_time < 60 {
+                return Err(format!(
+                    "第 {} 个循环恒压充电时间过短 ({}s < 60s)",
+                    i + 1,
+                    f.cv_charge_time
+                ));
+            }
+            if f.discharge_time < 60 {
+                return Err(format!(
+                    "第 {} 个循环放电时间过短 ({}s < 60s)",
+                    i + 1,
+                    f.discharge_time
+                ));
+            }
+            if f.discharge_platform_voltage < 3.0 || f.discharge_platform_voltage > 4.3 {
+                return Err(format!(
+                    "第 {} 个循环放电平台电压异常 ({:.3}V 超出 3.0-4.3V 范围)",
+                    i + 1,
+                    f.discharge_platform_voltage
+                ));
+            }
+            if f.cc_end_voltage < 4.0 || f.cc_end_voltage > 4.3 {
+                return Err(format!(
+                    "第 {} 个循环恒流结束电压异常 ({:.3}V 超出 4.0-4.3V 范围)",
+                    i + 1,
+                    f.cc_end_voltage
+                ));
+            }
+            if f.discharge_capacity < RATED_CAPACITY * 0.5 {
+                return Err(format!(
+                    "第 {} 个循环放电容量过低 ({:.3}Ah < {:.3}Ah)",
+                    i + 1,
+                    f.discharge_capacity,
+                    RATED_CAPACITY * 0.5
+                ));
+            }
+            if f.charge_capacity < RATED_CAPACITY * 0.5 {
+                return Err(format!(
+                    "第 {} 个循环充电容量过低 ({:.3}Ah < {:.3}Ah)",
+                    i + 1,
+                    f.charge_capacity,
+                    RATED_CAPACITY * 0.5
+                ));
+            }
+            if f.efficiency < 0.8 || f.efficiency > 1.0 {
+                return Err(format!(
+                    "第 {} 个循环充放电效率异常 ({:.3} 超出 0.8-1.0 范围)",
+                    i + 1,
+                    f.efficiency
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn average_features(&self, features: &[CycleFeatures]) -> CycleFeatures {

@@ -38,10 +38,12 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionConfig {
     pub voltage_deviation_sigma: f64,
+    pub voltage_deviation_absolute: f64,
     pub capacity_warning_ratio: f64,
     pub temperature_high_threshold: f64,
     pub cabinet_abnormal_ratio_threshold: f64,
     pub prediction_model_cycles: usize,
+    pub prediction_min_cycles: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +97,10 @@ impl Default for Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(3.0),
+                voltage_deviation_absolute: env::var("VOLTAGE_ABSOLUTE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.05),
                 capacity_warning_ratio: env::var("CAPACITY_WARNING")
                     .ok()
                     .and_then(|s| s.parse().ok())
@@ -108,6 +114,10 @@ impl Default for Config {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.10),
                 prediction_model_cycles: env::var("PREDICTION_CYCLES")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3),
+                prediction_min_cycles: env::var("PREDICTION_MIN_CYCLES")
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(3),

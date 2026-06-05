@@ -851,40 +851,96 @@ function renderStageSummaries(summaries) {
 function renderPrediction(data) {
     const container = document.getElementById('predictionContent');
     const status = data.status;
-    const predicted = status.predicted_capacity;
+    const predicted = status.predicted_capacity || 0;
     const rated = 3.2;
     const ratio = predicted / rated;
     const ratioClass = ratio >= 0.95 ? 'good' : (ratio >= 0.90 ? 'warning' : 'danger');
     
-    const html = `
-        <div class="prediction-item">
-            <span class="label">额定容量</span>
-            <span class="value">${rated.toFixed(2)} Ah</span>
-        </div>
-        <div class="prediction-item">
-            <span class="label">预测最终容量</span>
-            <span class="value ${ratioClass}">${predicted.toFixed(3)} Ah</span>
-        </div>
-        <div class="prediction-item">
-            <span class="label">预测容量比</span>
-            <span class="value ${ratioClass}">${(ratio * 100).toFixed(1)}%</span>
-        </div>
-        <div class="prediction-item">
-            <span class="label">当前容量</span>
-            <span class="value">${status.current_capacity.toFixed(3)} Ah</span>
-        </div>
-        <div class="prediction-item">
-            <span class="label">预测结果</span>
-            <span class="value ${ratio < 0.9 ? 'danger' : 'good'}">
-                ${ratio < 0.9 ? '⚠️ 降级品' : '✅ 合格品'}
-            </span>
-        </div>
-        <div class="prediction-bar">
-            <div class="prediction-bar-fill" style="width: ${Math.min(100, ratio * 100)}%;"></div>
-        </div>
-    `;
+    const predictionStatus = status.prediction_status || 0;
+    const completedCycles = status.completed_cycles || 0;
+    const minCycles = 3;
     
-    container.innerHTML = html;
+    const statusMap = {
+        0: { text: '待预测', class: 'neutral', icon: '⏳' },
+        1: { text: '预测中', class: 'warning', icon: '🔄' },
+        2: { text: '预测完成', class: 'good', icon: '✅' },
+        3: { text: '数据不足', class: 'warning', icon: '⚠️' }
+    };
+    
+    const statusInfo = statusMap[predictionStatus] || statusMap[0];
+    const isCompleted = predictionStatus === 2;
+    const progressPercent = Math.min(100, (completedCycles / minCycles) * 100);
+    
+    let predictionHtml = '';
+    
+    if (isCompleted) {
+        predictionHtml = `
+            <div class="prediction-item">
+                <span class="label">额定容量</span>
+                <span class="value">${rated.toFixed(2)} Ah</span>
+            </div>
+            <div class="prediction-item">
+                <span class="label">预测最终容量</span>
+                <span class="value ${ratioClass}">${predicted.toFixed(3)} Ah</span>
+            </div>
+            <div class="prediction-item">
+                <span class="label">预测容量比</span>
+                <span class="value ${ratioClass}">${(ratio * 100).toFixed(1)}%</span>
+            </div>
+            <div class="prediction-item">
+                <span class="label">当前容量</span>
+                <span class="value">${status.current_capacity.toFixed(3)} Ah</span>
+            </div>
+            <div class="prediction-item">
+                <span class="label">预测结果</span>
+                <span class="value ${ratio < 0.9 ? 'danger' : 'good'}">
+                    ${ratio < 0.9 ? '⚠️ 降级品' : '✅ 合格品'}
+                </span>
+            </div>
+            <div class="prediction-bar">
+                <div class="prediction-bar-fill" style="width: ${Math.min(100, ratio * 100)}%;"></div>
+            </div>
+        `;
+    } else {
+        let message = '';
+        if (predictionStatus === 1) {
+            message = `正在收集循环数据，已完成 ${completedCycles}/${minCycles} 个循环`;
+        } else if (predictionStatus === 3) {
+            message = `数据不完整，已完成 ${completedCycles}/${minCycles} 个循环，需要更多完整循环数据`;
+        } else {
+            message = `等待循环数据，已完成 ${completedCycles}/${minCycles} 个循环`;
+        }
+        
+        predictionHtml = `
+            <div class="prediction-item">
+                <span class="label">额定容量</span>
+                <span class="value">${rated.toFixed(2)} Ah</span>
+            </div>
+            <div class="prediction-item">
+                <span class="label">预测状态</span>
+                <span class="value ${statusInfo.class}">${statusInfo.icon} ${statusInfo.text}</span>
+            </div>
+            <div class="prediction-item">
+                <span class="label">已完成循环</span>
+                <span class="value">${completedCycles} / ${minCycles}</span>
+            </div>
+            <div class="prediction-item">
+                <span class="label">当前容量</span>
+                <span class="value">${status.current_capacity.toFixed(3)} Ah</span>
+            </div>
+            <div class="prediction-item" style="grid-column: span 2;">
+                <span class="label" style="width: 100%;">${message}</span>
+            </div>
+            <div class="prediction-bar" style="grid-column: span 2; background: #2a2a3e;">
+                <div class="prediction-bar-fill" style="width: ${progressPercent}%; background: linear-gradient(90deg, #667eea, #764ba2);"></div>
+            </div>
+            <div class="prediction-item" style="grid-column: span 2; text-align: center; color: #888; font-size: 0.9em;">
+                完成 ${minCycles} 个完整循环后自动开始容量预测
+            </div>
+        `;
+    }
+    
+    container.innerHTML = predictionHtml;
 }
 
 function formatDuration(seconds) {

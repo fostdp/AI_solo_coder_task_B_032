@@ -71,13 +71,16 @@ impl AnomalyDetector {
 
         let deviation = (data.voltage - avg).abs();
         let sigma_threshold = self.config.voltage_deviation_sigma * std;
+        let absolute_threshold = self.config.voltage_deviation_absolute;
+
+        let effective_threshold = sigma_threshold.max(absolute_threshold);
 
         let key = (data.cabinet_id, data.channel_id);
         let mut deviations = self
             .recent_voltage_deviations
             .entry(key)
             .or_insert_with(Vec::new);
-        
+
         deviations.push((data.timestamp, deviation));
         deviations.retain(|(t, _)| {
             (data.timestamp - *t).num_seconds() < 60
@@ -85,7 +88,7 @@ impl AnomalyDetector {
 
         let sustained_deviations = deviations
             .iter()
-            .filter(|(_, d)| *d > sigma_threshold)
+            .filter(|(_, d)| *d > effective_threshold)
             .count();
 
         if sustained_deviations >= 3 {
@@ -96,9 +99,22 @@ impl AnomalyDetector {
 
             self.set_cooldown(data.cabinet_id, data.channel_id, anomaly_type);
 
+            let sigma_value = if std > 0.0 {
+                deviation / std
+            } else {
+                f64::INFINITY
+            };
+
             info!(
-                "Voltage deviation detected: cabinet={}, channel={}, voltage={}, avg={}, sigma={}",
-                data.cabinet_id, data.channel_id, data.voltage, avg, deviation / std
+                "Voltage deviation detected: cabinet={}, channel={}, voltage={:.4}V, avg={:.4}V, sigma={:.2}, sigma_threshold={:.4}V, absolute_threshold={:.4}V, effective_threshold={:.4}V",
+                data.cabinet_id,
+                data.channel_id,
+                data.voltage,
+                avg,
+                sigma_value,
+                sigma_threshold,
+                absolute_threshold,
+                effective_threshold
             );
 
             return Some(Anomaly {
@@ -108,13 +124,17 @@ impl AnomalyDetector {
                 anomaly_type,
                 severity: Severity::Warning,
                 description: format!(
-                    "电压偏离平均值 {:.2}σ，当前电压 {:.4}V，柜平均 {:.4}V",
-                    deviation / std,
+                    "电压偏离平均值 {:.2}σ ({:.4}V)，当前电压 {:.4}V，柜平均 {:.4}V，有效阈值 {:.4}V (3σ={:.4}V, 绝对={:.4}V)",
+                    sigma_value,
+                    deviation,
                     data.voltage,
-                    avg
+                    avg,
+                    effective_threshold,
+                    sigma_threshold,
+                    absolute_threshold
                 ),
                 value: data.voltage,
-                threshold: avg + sigma_threshold,
+                threshold: avg + effective_threshold,
                 is_paused: false,
                 resolved: false,
             });
