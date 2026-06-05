@@ -1,0 +1,32 @@
+[package]
+name = "battery-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+rumqttc = "0.22"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clickhouse = { version = "0.12", features = ["derive", "chrono", "uuid"] }
+uuid = { version = "1.0", features = ["serde", "v4"] }
+axum = "0.6"
+tower-http = { version = "0.4", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+serde_repr = "0.1"
+thiserror = "1.0"
+anyhow = "1.0"
+futures = "0.3"
+parking_lot = "0.12"
+dashmap = "5.5"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>锂电池化成工艺监控与容量预测系统</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header class="header">
+        <h1>锂电池化成工艺监控与容量预测系统</h1>
+        <div class="header-stats" id="systemStats">
+            <div class="stat-item">
+                <span class="stat-label">总化成柜</span>
+                <span class="stat-value" id="totalCabinets">20</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">总通道</span>
+                <span class="stat-value" id="totalChannels">10240</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">异常通道</span>
+                <span class="stat-value abnormal" id="abnormalChannels">0</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">平均容量比</span>
+                <span class="stat-value" id="avgCapacity">0%</span>
+            </div>
+        </div>
+    </header>
+
+    <div class="main-container">
+        <aside class="sidebar">
+            <h3>化成柜列表</h3>
+            <div class="cabinet-list" id="cabinetList"></div>
+            
+            <div class="legend">
+                <h4>图例说明</h4>
+                <div class="legend-item">
+                    <span class="legend-color" style="background: #00FF00;"></span>
+                    <span>容量 &gt; 95%</span>
+                </div>
+                <div class="legend-item">
+                    <span class="legend-color" style="background: #FFFF00;"></span>
+                    <span>容量 90% - 95%</span>
+                </div>
+                <div class="legend-item">
+                    <span class="legend-color" style="background: #FF6600;"></span>
+                    <span>容量 &lt; 90%</span>
+                </div>
+                <div class="legend-item">
+                    <span class="legend-color" style="background: #FF0000;"></span>
+                    <span>异常通道</span>
+                </div>
+                <div class="legend-item">
+                    <span class="legend-color" style="background: #808080;"></span>
+                    <span>已暂停</span>
+                </div>
+            </div>
+
+            <div class="alerts-panel">
+                <h4>最近告警</h4>
+                <div class="alerts-list" id="alertsList"></div>
+            </div>
+        </aside>
+
+        <main class="content">
+            <div class="panel-header">
+                <h2 id="currentCabinetTitle">化成柜 0 - 实时监控</h2>
+                <div class="panel-controls">
+                    <button class="btn" onclick="refreshPanel()">刷新</button>
+                    <button class="btn" onclick="toggleAutoRefresh()">
+                        <span id="autoRefreshText">自动刷新: 开</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="cabinet-stats-bar" id="cabinetStats"></div>
+
+            <div class="canvas-container">
+                <canvas id="cabinetCanvas" width="1200" height="1200"></canvas>
+                <div class="canvas-overlay" id="canvasOverlay"></div>
+            </div>
+
+            <div class="panel-info">
+                <p>提示：点击任意通道色块查看详细信息和充放电曲线</p>
+            </div>
+        </main>
+    </div>
+
+    <div class="modal" id="channelModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modalTitle">通道详情</h3>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="channel-info" id="channelInfo"></div>
+                
+                <div class="chart-section">
+                    <h4>充放电曲线</h4>
+                    <div class="chart-container">
+                        <canvas id="chargeDischargeChart" width="800" height="300"></canvas>
+                    </div>
+                    <div class="chart-legend">
+                        <span><i class="legend-dot" style="background: #FF4444;"></i> 电压 (V)</span>
+                        <span><i class="legend-dot" style="background: #4444FF;"></i> 电流 (A)</span>
+                        <span><i class="legend-dot" style="background: #44AA44;"></i> 温度 (°C)</span>
+                        <span><i class="legend-dot" style="background: #FFAA00;"></i> 容量 (Ah)</span>
+                    </div>
+                </div>
+
+                <div class="chart-section">
+                    <h4>容量衰减趋势</h4>
+                    <div class="chart-container">
+                        <canvas id="capacityTrendChart" width="800" height="250"></canvas>
+                    </div>
+                </div>
+
+                <div class="stage-summary">
+                    <h4>各阶段统计</h4>
+                    <div class="stage-grid" id="stageGrid"></div>
+                </div>
+
+                <div class="prediction-section">
+                    <h4>容量预测</h4>
+                    <div class="prediction-content" id="predictionContent"></div>
+                </div>
+
+                <div class="modal-actions">
+                    <button class="btn btn-danger" id="pauseBtn" onclick="toggleChannelPause()">暂停通道</button>
+                    <button class="btn" onclick="predictCapacity()">预测容量</button>
+                    <button class="btn" onclick="refreshChannelDetail()">刷新数据</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
