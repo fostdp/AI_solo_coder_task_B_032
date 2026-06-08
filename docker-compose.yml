@@ -1,17 +1,30 @@
 version: '3.8'
 
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "3"
+    tag: "{{.Name}}/{{.ID}}"
+
+x-restart: &default-restart
+  restart: unless-stopped
+
 services:
+  # ============================================
+  # ClickHouse - 列式数据库存储
+  # ============================================
   clickhouse:
-    image: clickhouse/clickhouse-server:23.8
+    image: clickhouse/clickhouse-server:23.8-alpine
     container_name: battery-clickhouse
-    restart: unless-stopped
+    <<: *default-restart
     ports:
       - "8123:8123"
       - "9000:9000"
     environment:
       - CLICKHOUSE_DB=battery_monitor
       - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
       - TZ=Asia/Shanghai
     volumes:
       - clickhouse_data:/var/lib/clickhouse
@@ -29,35 +42,60 @@ services:
       start_period: 30s
     networks:
       - battery-network
+    logging: *default-logging
 
+  # ============================================
+  # EMQX - MQTT Broker (高性能物联网消息中间件)
+  # ============================================
   mqtt-broker:
-    image: eclipse-mosquitto:2.0
+    image: emqx/emqx:5.3.0-alpine
     container_name: battery-mqtt
-    restart: unless-stopped
+    <<: *default-restart
     ports:
-      - "1883:1883"
-      - "9001:9001"
+      - "1883:1883"       # MQTT TCP
+      - "8883:8883"       # MQTT SSL
+      - "8083:8083"       # MQTT WebSocket
+      - "8084:8084"       # MQTT WebSocket SSL
+      - "18083:18083"     # EMQX Dashboard
     environment:
       - TZ=Asia/Shanghai
+      - EMQX_NAME=battery-emqx
+      - EMQX_HOST=mqtt-broker
+      - EMQX_NODE__COOKIE=battery_monitor_cookie
+      - EMQX_LISTENERS__TCP__DEFAULT__BIND=0.0.0.0:1883
+      - EMQX_LISTENERS__TCP__DEFAULT__MAX_CONNECTIONS=100000
+      - EMQX_LISTENERS__WS__DEFAULT__BIND=0.0.0.0:8083
+      - EMQX_MQTT__MAX_PACKET_SIZE=1MB
+      - EMQX_LOG__LEVEL=info
+      - EMQX_ALLOW_ANONYMOUS=true
+      - EMQX_ENABLE_DASHBOARD=true
+      - EMQX_DASHBOARD__DEFAULT_USERNAME=${EMQX_DASHBOARD_USER:-admin}
+      - EMQX_DASHBOARD__DEFAULT_PASSWORD=${EMQX_DASHBOARD_PASSWORD:-public}
     volumes:
-      - mqtt_data:/mosquitto/data
-      - mqtt_log:/mosquitto/log
-      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - emqx_data:/opt/emqx/data
+      - emqx_log:/opt/emqx/log
+      - ./emqx/emqx.conf:/opt/emqx/etc/emqx.conf:ro
     healthcheck:
-      test: ["CMD", "mosquitto_sub", "-t", "$SYS/broker/version", "-C", "1", "-i", "healthcheck"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD", "emqx", "ctl", "status"]
+      interval: 15s
+      timeout: 10s
       retries: 5
-      start_period: 10s
+      start_period: 20s
     networks:
       - battery-network
+    logging: *default-logging
 
+  # ============================================
+  # Rust Backend - 电池监控后端服务
+  # ============================================
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
     container_name: battery-backend
-    restart: unless-stopped
+    <<: *default-restart
     ports:
       - "8080:8080"
     environment:
@@ -66,9 +104,18 @@ services:
       - MQTT_PORT=1883
       - CLICKHOUSE_URL=http://clickhouse:8123
       - CLICKHOUSE_DB=battery_monitor
-      - RUST_LOG=info,battery_monitor=debug
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
+      - RUST_LOG=${RUST_LOG:-info,battery_monitor=info}
       - RUST_BACKTRACE=1
       - MODEL_CONFIG_PATH=/app/model_config.json
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-NMC_3Ah}
+      - CHANNELS_PER_CABINET=512
+      - NUM_CABINETS=20
+      - ANOMALY_SIGMA_THRESHOLD=3.0
+      - ANOMALY_ABSOLUTE_THRESHOLD=0.02
+      - DEGRADED_CAPACITY_RATIO=0.9
+      - CABINET_ANOMALY_RATIO=0.1
     env_file:
       - .env
     depends_on:
@@ -80,17 +127,21 @@ services:
       - ./backend/model_config.json:/app/model_config.json:ro
     networks:
       - battery-network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "3"
-        tag: "{{.Name}}/{{.ID}}"
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
 
+  # ============================================
+  # Frontend - Nginx 静态资源服务 (Gzip + 缓存)
+  # ============================================
   frontend:
-    image: nginx:alpine
+    image: nginx:1.25-alpine
     container_name: battery-frontend
-    restart: unless-stopped
+    <<: *default-restart
     ports:
       - "80:80"
     environment:
@@ -107,24 +158,34 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+        tag: "{{.Name}}/{{.ID}}"
 
+  # ============================================
+  # Simulator - 化成柜模拟器
+  # ============================================
   simulator:
     build:
       context: ./simulator
       dockerfile: Dockerfile
     container_name: battery-simulator
-    restart: unless-stopped
+    <<: *default-restart
     environment:
       - TZ=Asia/Shanghai
       - MQTT_BROKER=mqtt-broker
       - MQTT_PORT=1883
-      - NUM_CABINETS=20
-      - CHANNELS_PER_CABINET=512
-      - REPORT_INTERVAL=10
-      - ABNORMAL_RATIO=0.03
-      - ANOMALY_DURATION_MIN=60
-      - ANOMALY_DURATION_MAX=300
-      - RATED_CAPACITY=3.2
+      - MQTT_USERNAME=${MQTT_USERNAME:-}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      - NUM_CABINETS=${SIM_NUM_CABINETS:-20}
+      - CHANNELS_PER_CABINET=${SIM_CHANNELS_PER_CABINET:-512}
+      - REPORT_INTERVAL=${SIM_REPORT_INTERVAL:-10}
+      - ABNORMAL_RATIO=${SIM_ABNORMAL_RATIO:-0.03}
+      - ANOMALY_DURATION_MIN=${SIM_ANOMALY_DURATION_MIN:-60}
+      - ANOMALY_DURATION_MAX=${SIM_ANOMALY_DURATION_MAX:-300}
+      - RATED_CAPACITY=${SIM_RATED_CAPACITY:-3.2}
+      - CAPACITY_FACTOR_MIN=${SIM_CAPACITY_FACTOR_MIN:-0.85}
+      - CAPACITY_FACTOR_MAX=${SIM_CAPACITY_FACTOR_MAX:-1.05}
+      - BATCH_SIZE=${SIM_BATCH_SIZE:-64}
+      - MQTT_QOS=${SIM_MQTT_QOS:-1}
     env_file:
       - .env
     depends_on:
@@ -137,14 +198,24 @@ services:
       options:
         max-size: "20m"
         max-file: "3"
+        tag: "{{.Name}}/{{.ID}}"
     profiles:
       - simulator
       - all
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
 
+  # ============================================
+  # Prometheus - 指标监控
+  # ============================================
   prometheus:
     image: prom/prometheus:v2.48.0
     container_name: battery-prometheus
-    restart: unless-stopped
+    <<: *default-restart
     ports:
       - "9090:9090"
     environment:
@@ -155,25 +226,34 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
       - '--storage.tsdb.retention.time=15d'
+      - '--storage.tsdb.retention.size=50GB'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
     networks:
       - battery-network
+    logging: *default-logging
     profiles:
       - monitoring
       - all
 
+  # ============================================
+  # Grafana - 可视化监控面板
+  # ============================================
   grafana:
     image: grafana/grafana:10.2.0
     container_name: battery-grafana
-    restart: unless-stopped
+    <<: *default-restart
     ports:
       - "3000:3000"
     environment:
       - TZ=Asia/Shanghai
-      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin123}
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
@@ -182,22 +262,49 @@ services:
       - prometheus
     networks:
       - battery-network
+    logging: *default-logging
     profiles:
       - monitoring
       - all
 
+# ============================================
+# Volumes - 数据持久化
+# ============================================
 volumes:
   clickhouse_data:
     driver: local
-  mqtt_data:
+    driver_opts:
+      type: none
+      device: ${DATA_PATH:-./data}/clickhouse
+      o: bind
+  emqx_data:
     driver: local
-  mqtt_log:
+    driver_opts:
+      type: none
+      device: ${DATA_PATH:-./data}/emqx/data
+      o: bind
+  emqx_log:
     driver: local
+    driver_opts:
+      type: none
+      device: ${DATA_PATH:-./data}/emqx/log
+      o: bind
   prometheus_data:
     driver: local
+    driver_opts:
+      type: none
+      device: ${DATA_PATH:-./data}/prometheus
+      o: bind
   grafana_data:
     driver: local
+    driver_opts:
+      type: none
+      device: ${DATA_PATH:-./data}/grafana
+      o: bind
 
+# ============================================
+# Networks
+# ============================================
 networks:
   battery-network:
     driver: bridge
