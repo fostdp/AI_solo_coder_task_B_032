@@ -1,10 +1,14 @@
 use crate::alarm_sender::AlarmSender;
 use crate::capacity_predictor::CapacityPredictor;
 use crate::cell_grouping::{CellGroupingService, GroupingConfig};
+use crate::cell_matcher::CellMatcherHandle;
 use crate::database::Database;
 use crate::degradation_analyzer::DegradationAnalysisService;
+use crate::aging_classifier::AgingClassifierHandle;
 use crate::electrolyte_optimizer::ElectrolyteOptimizationService;
+use crate::electrolyte_optimizer::ElectrolyteOptimizerHandle;
 use crate::mes_integrator::MesIntegrationService;
+use crate::mes_connector::MesConnectorHandle;
 use crate::messages::PredictionRequest;
 use crate::models::{
     BatchQueryRequest, CabinetStats, ChannelHistory, ChannelStatus, CHANNELS_PER_CABINET,
@@ -79,6 +83,10 @@ pub struct ApiState {
     pub electrolyte_service: Arc<std::sync::Mutex<ElectrolyteOptimizationService>>,
     pub degradation_service: Arc<std::sync::Mutex<DegradationAnalysisService>>,
     pub mes_service: Arc<std::sync::Mutex<MesIntegrationService>>,
+    pub cell_matcher: CellMatcherHandle,
+    pub electrolyte_optimizer: ElectrolyteOptimizerHandle,
+    pub aging_classifier: AgingClassifierHandle,
+    pub mes_connector: MesConnectorHandle,
 }
 
 pub fn create_router(state: Arc<ApiState>) -> Router {

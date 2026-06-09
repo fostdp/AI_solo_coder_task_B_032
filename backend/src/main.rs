@@ -3,12 +3,15 @@ mod anomaly_detector;
 mod api;
 mod capacity_predictor;
 mod cell_grouping;
+mod cell_matcher;
 mod config;
 mod data_pipeline;
 mod database;
 mod degradation_analyzer;
+mod aging_classifier;
 mod electrolyte_optimizer;
 mod mes_integrator;
+mod mes_connector;
 mod messages;
 mod metrics;
 mod models;
@@ -20,12 +23,15 @@ use crate::anomaly_detector::AnomalyDetector;
 use crate::api::{create_router, ApiState};
 use crate::capacity_predictor::CapacityPredictor;
 use crate::cell_grouping::CellGroupingService;
+use crate::cell_matcher::{CellMatcherHandle, CellMatcherService, MatcherConfig};
 use crate::config::Config;
 use crate::data_pipeline::DataPipeline;
 use crate::database::Database;
 use crate::degradation_analyzer::DegradationAnalysisService;
-use crate::electrolyte_optimizer::ElectrolyteOptimizationService;
+use crate::aging_classifier::{AgingClassifierHandle, AgingClassifierService, ClassifierConfig};
+use crate::electrolyte_optimizer::{ElectrolyteOptimizationService, ElectrolyteOptimizerHandle, OptimizerConfig};
 use crate::mes_integrator::MesIntegrationService;
+use crate::mes_connector::{ConnectorConfig, MesConnectorHandle, MesConnectorService};
 use crate::messages::{
     AlertSender, AnomalyReceiver, AnomalySender, PauseReceiver, PauseSender, PredictionReceiver,
     PredictionSender, PredictionResultReceiver, PredictionResultSender,
@@ -171,22 +177,42 @@ async fn main() -> Result<()> {
     let grouping_service = Arc::new(std::sync::Mutex::new(
         CellGroupingService::default()
     ));
-    info!("Cell grouping service initialized");
+    info!("Cell grouping service initialized (legacy)");
+
+    let matcher_config = MatcherConfig::default();
+    let (matcher_service, cell_matcher_handle) = CellMatcherService::new(matcher_config);
+    tokio::spawn(matcher_service.run());
+    info!("Cell matcher service initialized (async, genetic algorithm in separate task)");
 
     let electrolyte_service = Arc::new(std::sync::Mutex::new(
         ElectrolyteOptimizationService::default()
     ));
-    info!("Electrolyte optimization service initialized");
+    info!("Electrolyte optimization service initialized (legacy)");
+
+    let optimizer_config = OptimizerConfig::default();
+    let (optimizer_service, electrolyte_optimizer_handle) = ElectrolyteOptimizerService::new(optimizer_config);
+    tokio::spawn(optimizer_service.run());
+    info!("Electrolyte optimizer service initialized (async)");
 
     let degradation_service = Arc::new(std::sync::Mutex::new(
         DegradationAnalysisService::default()
     ));
-    info!("Degradation analysis service initialized");
+    info!("Degradation analysis service initialized (legacy)");
+
+    let classifier_config = ClassifierConfig::default();
+    let (classifier_service, aging_classifier_handle) = AgingClassifierService::new(classifier_config);
+    tokio::spawn(classifier_service.run());
+    info!("Aging classifier service initialized (async, with transfer learning)");
 
     let mes_service = Arc::new(std::sync::Mutex::new(
         MesIntegrationService::new(db.clone())
     ));
-    info!("MES integration service initialized");
+    info!("MES integration service initialized (legacy)");
+
+    let connector_config = ConnectorConfig::default();
+    let (connector_service, mes_connector_handle) = MesConnectorService::new(connector_config);
+    tokio::spawn(connector_service.run());
+    info!("MES connector service initialized (async, message queue based)");
 
     mqtt_collector.start().await?;
     info!("MQTT collector started");
@@ -228,6 +254,10 @@ async fn main() -> Result<()> {
         electrolyte_service: electrolyte_service.clone(),
         degradation_service: degradation_service.clone(),
         mes_service: mes_service.clone(),
+        cell_matcher: cell_matcher_handle,
+        electrolyte_optimizer: electrolyte_optimizer_handle,
+        aging_classifier: aging_classifier_handle,
+        mes_connector: mes_connector_handle,
     });
 
     let cors = CorsLayer::new()
@@ -248,7 +278,7 @@ async fn main() -> Result<()> {
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     info!("Starting HTTP server on {}", addr);
-    info!("System architecture (v1.1.0 - Extended):");
+    info!("System architecture (v2.0.0 - Modular Async):");
     info!("  ┌─────────────────┐      ┌─────────────────┐      ┌──────────────────┐");
     info!("  │  MQTT Collector │─────▶│  Data Pipeline  │─────▶│ Anomaly Detector │");
     info!("  └─────────────────┘      └─────────────────┘      └────────┬─────────┘");
@@ -258,11 +288,17 @@ async fn main() -> Result<()> {
     info!("                    │ Capacity Predictor   │      │   Alarm Sender    │");
     info!("                    └──────────────────────┘      └───────────────────┘");
     info!("");
-    info!("  New Features (v1.1.0):");
+    info!("  New Async Modules (v2.0.0):");
     info!("  ┌───────────────────┐  ┌────────────────────┐  ┌────────────────────┐  ┌────────────┐");
-    info!("  │  Cell Grouping    │  │ Electrolyte Opt    │  │ Degradation Analy  │  │  MES Sync  │");
-    info!("  │ (GA + Greedy)     │  │ (Feedback Control) │  │ (dQ/dV Analysis)   │  │ (MES/ERP)  │");
-    info!("  └───────────────────┘  └────────────────────┘  └────────────────────┘  └────────────┘");
+    info!("  │   Cell Matcher    │  │ Electrolyte Opt    │  │ Aging Classifier   │  │MES Connector│");
+    info!("  │(Async GA + Greedy)│  │(Async + Safe Limit)│  │(Transfer Learning) │  │(Msg Queue)  │");
+    info!("  └──────┬────────────┘  └────────┬───────────┘  └────────┬───────────┘  └─────┬──────┘");
+    info!("         ▼                      ▼                       ▼                    ▼");
+    info!("    Tokio Task             Tokio Task              Tokio Task           Tokio Task");
+    info!("(spawn_blocking)       (spawn_blocking)        (spawn_blocking)      (spawn_blocking)");
+    info!("");
+    info!("Legacy modules retained for backward compatibility:");
+    info!("  cell_grouping, electrolyte_optimizer, degradation_analyzer, mes_integrator");
     info!("");
     info!("Prometheus metrics available at /metrics endpoint");
 
