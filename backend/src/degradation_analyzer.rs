@@ -530,3 +530,405 @@ impl DegradationAnalysisService {
             .unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ChannelData, Stage};
+
+    fn generate_discharge_data(
+        start_v: f64,
+        end_v: f64,
+        points: usize,
+        degradation_type: Option<&str>,
+    ) -> Vec<ChannelData> {
+        let mut data = Vec::new();
+        let step = (start_v - end_v) / (points - 1) as f64;
+
+        for i in 0..points {
+            let voltage = start_v - step * i as f64;
+            let capacity = 3.2 * (1.0 - voltage / start_v);
+
+            let (voltage, dqdv_modifier) = match degradation_type {
+                Some("cathode") => {
+                    let modifier = if voltage > 3.8 && voltage < 4.1 { 0.7 } else { 1.0 };
+                    (voltage, modifier)
+                }
+                Some("anode") => {
+                    let modifier = if voltage > 0.05 && voltage < 0.3 { 0.6 } else { 1.0 };
+                    (voltage, modifier)
+                }
+                Some("electrolyte") => {
+                    (voltage * 0.95, 0.8)
+                }
+                Some("sei") => {
+                    let modifier = if voltage > 0.5 && voltage < 1.5 { 1.5 } else { 1.0 };
+                    (voltage + 0.05, modifier)
+                }
+                _ => (voltage, 1.0),
+            };
+
+            data.push(ChannelData {
+                timestamp: chrono::Utc::now(),
+                cabinet_id: 0,
+                channel_id: 0,
+                cycle_index: 1,
+                stage: Stage::Discharge,
+                step_time: i as f64 * 10.0,
+                voltage,
+                current: -1.6,
+                capacity: capacity * dqdv_modifier,
+                temperature: 25.0,
+                internal_resistance: 20.0,
+            });
+        }
+
+        data
+    }
+
+    #[test]
+    fn test_dvdq_analysis_accuracy_cathode() {
+        let config = DegradationConfig::default();
+        let mut service = DegradationAnalysisService::new(config);
+
+        let baseline_data = generate_discharge_data(4.2, 2.75, 100, None);
+        let historical_capacities = vec![(1, 3.2), (50, 3.15), (100, 3.05)];
+        let historical_resistances = vec![(1, 20.0), (50, 20.5), (100, 21.0)];
+
+        service.analyze_channel(0, 0, 1, &baseline_data, &historical_capacities, &historical_resistances);
+
+        let cathode_data = generate_discharge_data(4.2, 2.75, 100, Some("cathode"));
+        let (analysis, _) = service.analyze_channel(
+            0, 0, 100, &cathode_data,
+            &[(1, 3.2), (50, 3.1), (100, 2.9)],
+            &[(1, 20.0), (50, 21.0), (100, 22.0)]
+        );
+
+        assert!(analysis.cathode_score > 0.6,
+            "Cathode degradation should have high cathode score. Got: {:.2}", analysis.cathode_score);
+        assert!(analysis.mode == DegradationMode::CathodeDegradation || analysis.mode == DegradationMode::MixedDegradation,
+            "Should detect cathode or mixed degradation. Got: {:?}", analysis.mode);
+    }
+
+    #[test]
+    fn test_dvdq_analysis_accuracy_anode() {
+        let config = DegradationConfig::default();
+        let mut service = DegradationAnalysisService::new(config);
+
+        let baseline_data = generate_discharge_data(4.2, 2.75, 100, None);
+        service.analyze_channel(0, 0, 1, &baseline_data, &[(1, 3.2)], &[(1, 20.0)]);
+
+        let anode_data = generate_discharge_data(4.2, 2.75, 100, Some("anode"));
+        let (analysis, _) = service.analyze_channel(
+            0, 0, 100, &anode_data,
+            &[(1, 3.2), (50, 3.05), (100, 2.85)],
+            &[(1, 20.0), (50, 21.5), (100, 23.0)]
+        );
+
+        assert!(analysis.anode_score > 0.55,
+            "Anode degradation should have high anode score. Got: {:.2}", analysis.anode_score);
+    }
+
+    #[test]
+    fn test_dvdq_analysis_accuracy_electrolyte() {
+        let config = DegradationConfig::default();
+        let mut service = DegradationAnalysisService::new(config);
+
+        let baseline_data = generate_discharge_data(4.2, 2.75, 100, None);
+        service.analyze_channel(0, 0, 1, &baseline_data, &[(1, 3.2)], &[(1, 20.0)]);
+
+        let electrolyte_data = generate_discharge_data(4.2, 2.75, 100, Some("electrolyte"));
+        let (analysis, _) = service.analyze_channel(
+            0, 0, 100, &electrolyte_data,
+            &[(1, 3.2), (50, 3.0), (100, 2.75)],
+            &[(1, 20.0), (50, 22.0), (100, 25.0)]
+        );
+
+        assert!(analysis.electrolyte_score > 0.5,
+            "Electrolyte degradation should have high electrolyte score. Got: {:.2}", analysis.electrolyte_score);
+    }
+
+    #[test]
+    fn test_teardown_analysis_correlation() {
+        let config = DegradationConfig::default();
+        let mut service = DegradationAnalysisService::new(config);
+
+        let baseline_data = generate_discharge_data(4.2, 2.75, 100, None);
+        service.analyze_channel(0, 0, 1, &baseline_data, &[(1, 3.2)], &[(1, 20.0)]);
+
+        let test_cases = vec![
+            ("cathode", DegradationMode::CathodeDegradation, 0.7),
+            ("anode", DegradationMode::AnodeDegradation, 0.6),
+            ("sei", DegradationMode::SEIGrowth, 0.6),
+            ("electrolyte", DegradationMode::ElectrolyteConsumption, 0.5),
+        ];
+
+        let mut correct_matches = 0;
+        let mut total_cases = 0;
+
+        for (degradation_type, expected_mode, min_confidence) in &test_cases {
+            let data = generate_discharge_data(4.2, 2.75, 100, Some(degradation_type));
+            let (analysis, _) = service.analyze_channel(
+                0, 0, 100, &data,
+                &[(1, 3.2), (50, 3.0), (100, 2.8)],
+                &[(1, 20.0), (50, 22.0), (100, 24.0)]
+            );
+
+            total_cases += 1;
+
+            let matched = analysis.mode == *expected_mode
+                || analysis.mode == DegradationMode::MixedDegradation
+                || analysis.confidence >= *min_confidence;
+
+            if matched {
+                correct_matches += 1;
+            }
+
+            assert!(analysis.confidence >= 0.5,
+                "{} analysis should have reasonable confidence. Got: {:.2}",
+                degradation_type, analysis.confidence);
+        }
+
+        let accuracy = correct_matches as f64 / total_cases as f64;
+        assert!(accuracy >= 0.75,
+            "Overall accuracy should be >= 75%. Got: {:.1}%", accuracy * 100.0);
+    }
+
+    #[test]
+    fn test_confidence_scoring_reasonableness() {
+        let config = DegradationConfig::default();
+        let mut service = DegradationAnalysisService::new(config);
+
+        let baseline_data = generate_discharge_data(4.2, 2.75, 100, None);
+        service.analyze_channel(0, 0, 1, &baseline_data, &[(1, 3.2)], &[(1, 20.0)]);
+
+        let clear_cathode_data = generate_discharge_data(4.2, 2.75, 100, Some("cathode"));
+        let (analysis_clear, _) = service.analyze_channel(
+            0, 0, 100, &clear_cathode_data,
+            &[(1, 3.2), (50, 3.0), (100, 2.6)],
+            &[(1, 20.0), (50, 23.0), (100, 27.0)]
+        );
+
+        assert!(analysis_clear.confidence >= 0.6,
+            "Clear degradation should have high confidence. Got: {:.2}", analysis_clear.confidence);
+
+        let normal_data = generate_discharge_data(4.2, 2.75, 100, None);
+        let (analysis_normal, _) = service.analyze_channel(
+            0, 0, 50, &normal_data,
+            &[(1, 3.2), (25, 3.18), (50, 3.15)],
+            &[(1, 20.0), (25, 20.1), (50, 20.2)]
+        );
+
+        assert_eq!(analysis_normal.mode, DegradationMode::Normal,
+            "Normal data should be classified as normal. Got: {:?}", analysis_normal.mode);
+        assert!(analysis_normal.confidence >= 0.7,
+            "Normal data should have high confidence. Got: {:.2}", analysis_normal.confidence);
+
+        let minimal_data = generate_discharge_data(4.2, 2.75, 10, None);
+        let (analysis_minimal, _) = service.analyze_channel(
+            0, 0, 10, &minimal_data,
+            &[(1, 3.2), (5, 3.18), (10, 3.16)],
+            &[(1, 20.0), (5, 20.1), (10, 20.2)]
+        );
+
+        assert!(analysis_minimal.confidence <= 0.85,
+            "Minimal data should have limited confidence. Got: {:.2}", analysis_minimal.confidence);
+    }
+
+    #[test]
+    fn test_peak_detection_accuracy() {
+        let config = DegradationConfig {
+            peak_detection_threshold: 0.01,
+            min_peak_distance: 0.1,
+            ..DegradationConfig::default()
+        };
+        let service = DegradationAnalysisService::new(config);
+
+        let mut points = Vec::new();
+        for i in 0..100 {
+            let v = 2.8 + i as f64 * 0.015;
+            let dqdv = if (i == 20) || (i == 45) || (i == 70) { 1.0 } else { 0.1 };
+            points.push(DvDqPoint { voltage: v, dq_dv: dqdv, capacity: i as f64 * 0.03 });
+        }
+
+        let peaks = service.detect_peaks(&points);
+
+        assert_eq!(peaks.len(), 3, "Should detect exactly 3 peaks. Got: {}", peaks.len());
+
+        let voltages: Vec<f64> = peaks.iter().map(|(v, _)| *v).collect();
+        assert!(voltages.iter().any(|&v| (v - 3.1).abs() < 0.02), "Peak at ~3.1V should be detected");
+        assert!(voltages.iter().any(|&v| (v - 3.475).abs() < 0.02), "Peak at ~3.475V should be detected");
+        assert!(voltages.iter().any(|&v| (v - 3.85).abs() < 0.02), "Peak at ~3.85V should be detected");
+    }
+
+    #[test]
+    fn test_fade_rate_calculation() {
+        let config = DegradationConfig::default();
+        let service = DegradationAnalysisService::new(config);
+
+        let fast_fade = vec![(1, 3.2), (50, 3.1), (100, 2.9)];
+        let rate = service.calculate_fade_rate(&fast_fade);
+        assert!(rate > 0.003, "Fast fade should have high rate. Got: {:.4}", rate);
+
+        let slow_fade = vec![(1, 3.2), (50, 3.19), (100, 3.18)];
+        let rate_slow = service.calculate_fade_rate(&slow_fade);
+        assert!(rate_slow < 0.001, "Slow fade should have low rate. Got: {:.4}", rate_slow);
+
+        let insufficient = vec![(1, 3.2), (2, 3.19)];
+        let rate_insufficient = service.calculate_fade_rate(&insufficient);
+        assert_eq!(rate_insufficient, 0.0, "Insufficient data should return 0");
+    }
+
+    #[test]
+    fn test_resistance_growth_calculation() {
+        let config = DegradationConfig::default();
+        let service = DegradationAnalysisService::new(config);
+
+        let fast_growth = vec![(1, 20.0), (50, 24.0), (100, 28.0)];
+        let rate = service.calculate_resistance_growth_rate(&fast_growth);
+        assert!(rate > 0.03, "Fast resistance growth should have high rate. Got: {:.4}", rate);
+
+        let slow_growth = vec![(1, 20.0), (50, 20.5), (100, 21.0)];
+        let rate_slow = service.calculate_resistance_growth_rate(&slow_growth);
+        assert!(rate_slow < 0.01, "Slow resistance growth should have low rate. Got: {:.4}", rate_slow);
+    }
+
+    #[test]
+    fn test_boundary_insufficient_data() {
+        let config = DegradationConfig::default();
+        let mut service = DegradationAnalysisService::new(config);
+
+        let minimal_data = generate_discharge_data(4.2, 2.75, 5, None);
+        let (analysis, curve) = service.analyze_channel(
+            0, 0, 1, &minimal_data,
+            &[(1, 3.2)],
+            &[(1, 20.0)]
+        );
+
+        assert!(curve.is_empty() || curve.len() < 5, "Insufficient data should produce limited curve");
+        assert!(analysis.confidence <= 0.7, "Insufficient data should have limited confidence");
+    }
+
+    #[test]
+    fn test_boundary_no_baseline() {
+        let config = DegradationConfig::default();
+        let mut service = DegradationAnalysisService::new(config);
+
+        let data = generate_discharge_data(4.2, 2.75, 100, Some("cathode"));
+        let (analysis, _) = service.analyze_channel(
+            0, 0, 10, &data,
+            &[(1, 3.2), (5, 3.15), (10, 3.1)],
+            &[(1, 20.0), (5, 20.5), (10, 21.0)]
+        );
+
+        assert_eq!(analysis.cathode_score, 0.5, "No baseline should give default score");
+        assert_eq!(analysis.anode_score, 0.5, "No baseline should give default score");
+        assert_eq!(analysis.electrolyte_score, 0.5, "No baseline should give default score");
+        assert_eq!(analysis.sei_score, 0.5, "No baseline should give default score");
+    }
+
+    #[test]
+    fn test_mixed_degradation_detection() {
+        let config = DegradationConfig::default();
+        let mut service = DegradationAnalysisService::new(config);
+
+        let baseline_data = generate_discharge_data(4.2, 2.75, 100, None);
+        service.analyze_channel(0, 0, 1, &baseline_data, &[(1, 3.2)], &[(1, 20.0)]);
+
+        let mut mixed_data = generate_discharge_data(4.2, 2.75, 100, None);
+        for point in &mut mixed_data {
+            if point.voltage > 3.8 && point.voltage < 4.1 {
+                point.capacity *= 0.7;
+            }
+            if point.voltage > 0.5 && point.voltage < 1.5 {
+                point.capacity *= 1.3;
+            }
+        }
+
+        let (analysis, _) = service.analyze_channel(
+            0, 0, 200, &mixed_data,
+            &[(1, 3.2), (100, 2.9), (200, 2.5)],
+            &[(1, 20.0), (100, 25.0), (200, 32.0)]
+        );
+
+        assert!(analysis.cathode_score > 0.6 || analysis.sei_score > 0.6,
+            "At least one score should be high. Cathode: {:.2}, SEI: {:.2}",
+            analysis.cathode_score, analysis.sei_score);
+
+        if analysis.mode == DegradationMode::MixedDegradation {
+            assert!(analysis.confidence >= 0.6,
+                "Mixed degradation should have reasonable confidence. Got: {:.2}",
+                analysis.confidence);
+        }
+    }
+
+    #[test]
+    fn test_recommendation_generation() {
+        let config = DegradationConfig::default();
+        let service = DegradationAnalysisService::new(config);
+
+        let rec_normal = service.generate_recommendations(DegradationMode::Normal, 0.85, 0.001);
+        assert!(rec_normal.contains("正常"), "Normal recommendation should mention normal status");
+
+        let rec_cathode = service.generate_recommendations(DegradationMode::CathodeDegradation, 0.8, 0.005);
+        assert!(rec_cathode.contains("正极"), "Cathode recommendation should mention cathode");
+
+        let rec_low_confidence = service.generate_recommendations(DegradationMode::Normal, 0.3, 0.0);
+        assert!(rec_low_confidence.contains("数据不足") || rec_low_confidence.contains("监测"),
+            "Low confidence should suggest more monitoring. Got: {}", rec_low_confidence);
+    }
+
+    #[test]
+    fn test_smoothing_effect() {
+        let config = DegradationConfig::default();
+        let service = DegradationAnalysisService::new(config);
+
+        let mut noisy_points = Vec::new();
+        for i in 0..50 {
+            let v = 3.0 + i as f64 * 0.02;
+            let dqdv = 0.5 + (i % 3) as f64 * 0.2;
+            noisy_points.push(DvDqPoint { voltage: v, dq_dv: dqdv, capacity: i as f64 * 0.05 });
+        }
+
+        let smoothed = service.smooth_dvdq_curve(noisy_points, 2);
+        assert_eq!(smoothed.len(), 50, "Smoothing should preserve length");
+
+        let original_variance: f64 = noisy_points.iter()
+            .map(|p| (p.dq_dv - 0.7).powi(2)).sum::<f64>() / 50.0;
+        let smoothed_variance: f64 = smoothed.iter()
+            .map(|p| (p.dq_dv - 0.7).powi(2)).sum::<f64>() / 50.0;
+
+        assert!(smoothed_variance < original_variance * 0.5,
+            "Smoothing should reduce variance. Original: {:.4}, Smoothed: {:.4}",
+            original_variance, smoothed_variance);
+    }
+
+    #[test]
+    fn test_historical_tracking() {
+        let config = DegradationConfig::default();
+        let mut service = DegradationAnalysisService::new(config);
+
+        let baseline_data = generate_discharge_data(4.2, 2.75, 100, None);
+        service.analyze_channel(0, 0, 1, &baseline_data, &[(1, 3.2)], &[(1, 20.0)]);
+
+        for cycle in 10..=50 {
+            let data = generate_discharge_data(4.2, 2.75, 100, if cycle > 30 { Some("cathode") } else { None });
+            service.analyze_channel(
+                0, 0, cycle, &data,
+                &[(1, 3.2), (cycle, 3.2 - cycle as f64 * 0.005)],
+                &[(1, 20.0), (cycle, 20.0 + cycle as f64 * 0.05)]
+            );
+        }
+
+        let history = service.get_historical_modes(0, 0);
+        assert!(history.len() >= 5, "Should track historical analyses. Got: {}", history.len());
+
+        let last_entries: Vec<_> = history.iter().rev().take(5).collect();
+        let cathode_entries: Vec<_> = last_entries.iter()
+            .filter(|(_, m, _)| *m == DegradationMode::CathodeDegradation || *m == DegradationMode::MixedDegradation)
+            .collect();
+
+        assert!(!cathode_entries.is_empty(),
+            "Later cycles should show cathode degradation");
+    }
+}

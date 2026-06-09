@@ -440,3 +440,284 @@ pub fn generate_cell_info(
         cycle_index,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::RATED_CAPACITY;
+
+    fn generate_test_cells(count: usize, capacity_std: f64, resistance_std: f64) -> Vec<CellInfo> {
+        let mut rng = rand::thread_rng();
+        (0..count)
+            .map(|i| {
+                let measured_capacity = RATED_CAPACITY * (1.0 + rng.gen_range(-capacity_std..capacity_std));
+                let internal_resistance = 20.0 + rng.gen_range(-resistance_std..resistance_std);
+                generate_cell_info(
+                    (i / 512) as u16,
+                    (i % 512) as u32,
+                    "TEST-BATCH-001".to_string(),
+                    measured_capacity * 0.98,
+                    measured_capacity,
+                    internal_resistance,
+                    1,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_genetic_algorithm_minimizes_capacity_diff() {
+        let cells = generate_test_cells(100, 0.03, 1.0);
+
+        let config = GroupingConfig {
+            cells_per_group: 10,
+            max_capacity_diff: 0.1,
+            max_resistance_diff: 5.0,
+            min_capacity_ratio: 0.85,
+            algorithm: GroupingAlgorithm::Genetic,
+            genetic_params: GeneticParams {
+                population_size: 50,
+                max_generations: 30,
+                mutation_rate: 0.1,
+                crossover_rate: 0.8,
+                elite_count: 3,
+            },
+        };
+
+        let service = CellGroupingService::new(config);
+        let result = service.group_cells(cells.clone(), "TEST-BATCH-001".to_string());
+
+        assert!(result.group_count > 0, "Should create at least one group");
+
+        for group in &result.groups {
+            assert!(group.capacity_max_diff < 0.1,
+                "Capacity max diff {:.4} should be < 0.1", group.capacity_max_diff);
+            assert!(group.capacity_std < 0.03,
+                "Capacity std {:.4} should be < 0.03", group.capacity_std);
+        }
+    }
+
+    #[test]
+    fn test_genetic_algorithm_minimizes_resistance_diff() {
+        let cells = generate_test_cells(100, 0.02, 2.0);
+
+        let config = GroupingConfig {
+            cells_per_group: 10,
+            max_capacity_diff: 0.1,
+            max_resistance_diff: 5.0,
+            min_capacity_ratio: 0.85,
+            algorithm: GroupingAlgorithm::Genetic,
+            genetic_params: GeneticParams {
+                population_size: 50,
+                max_generations: 30,
+                mutation_rate: 0.1,
+                crossover_rate: 0.8,
+                elite_count: 3,
+            },
+        };
+
+        let service = CellGroupingService::new(config);
+        let result = service.group_cells(cells.clone(), "TEST-BATCH-001".to_string());
+
+        for group in &result.groups {
+            assert!(group.resistance_max_diff < 5.0,
+                "Resistance max diff {:.4} should be < 5.0", group.resistance_max_diff);
+            assert!(group.resistance_std < 2.0,
+                "Resistance std {:.4} should be < 2.0", group.resistance_std);
+        }
+    }
+
+    #[test]
+    fn test_genetic_vs_greedy_comparison() {
+        let cells = generate_test_cells(100, 0.03, 1.5);
+
+        let genetic_config = GroupingConfig {
+            algorithm: GroupingAlgorithm::Genetic,
+            ..GroupingConfig::default()
+        };
+        let greedy_config = GroupingConfig {
+            algorithm: GroupingAlgorithm::Greedy,
+            ..GroupingConfig::default()
+        };
+
+        let genetic_service = CellGroupingService::new(genetic_config);
+        let greedy_service = CellGroupingService::new(greedy_config);
+
+        let genetic_result = genetic_service.group_cells(cells.clone(), "TEST-BATCH-001".to_string());
+        let greedy_result = greedy_service.group_cells(cells.clone(), "TEST-BATCH-001".to_string());
+
+        assert!(genetic_result.avg_consistency_score >= greedy_result.avg_consistency_score * 0.95,
+            "Genetic avg consistency {:.2} should be >= greedy {:.2} * 0.95",
+            genetic_result.avg_consistency_score, greedy_result.avg_consistency_score);
+    }
+
+    #[test]
+    fn test_grouping_list_format_correctness() {
+        let cells = generate_test_cells(50, 0.02, 1.0);
+
+        let config = GroupingConfig {
+            cells_per_group: 10,
+            ..GroupingConfig::default()
+        };
+
+        let service = CellGroupingService::new(config);
+        let result = service.group_cells(cells, "TEST-BATCH-001".to_string());
+
+        assert_eq!(result.batch_id, "TEST-BATCH-001");
+        assert_eq!(result.cells_per_group, 10);
+        assert!(result.group_count <= 5);
+
+        for (i, group) in result.groups.iter().enumerate() {
+            assert_eq!(group.group_number, (i + 1) as u32);
+            assert_eq!(group.batch_id, "TEST-BATCH-001");
+            assert_eq!(group.cell_count, 10);
+            assert_eq!(group.cell_ids.len(), 10);
+            assert!(!group.group_id.is_empty());
+            assert!(group.avg_capacity > 0.0);
+            assert!(group.capacity_std >= 0.0);
+            assert!(group.consistency_score >= 0.0 && group.consistency_score <= 100.0);
+        }
+    }
+
+    #[test]
+    fn test_consistency_score_calculation_accuracy() {
+        let config = GroupingConfig::default();
+        let service = CellGroupingService::new(config);
+
+        let cells = vec![
+            generate_test_cells(1, 0.0, 0.0).remove(0),
+            generate_test_cells(1, 0.0, 0.0).remove(0),
+            generate_test_cells(1, 0.0, 0.0).remove(0),
+        ];
+
+        let cell_refs: Vec<&CellInfo> = cells.iter().collect();
+        let score = service.calculate_group_consistency(&cell_refs);
+
+        assert!(score > 90.0, "Identical cells should have high consistency score, got {:.2}", score);
+
+        let cells_diff = vec![
+            generate_test_cells(1, 0.0, 0.0).remove(0),
+            generate_test_cells(1, 0.05, 2.0).remove(0),
+            generate_test_cells(1, 0.08, 3.0).remove(0),
+        ];
+
+        let cell_refs_diff: Vec<&CellInfo> = cells_diff.iter().collect();
+        let score_diff = service.calculate_group_consistency(&cell_refs_diff);
+
+        assert!(score_diff < score, "Different cells should have lower consistency score");
+    }
+
+    #[test]
+    fn test_boundary_insufficient_cells() {
+        let cells = generate_test_cells(5, 0.02, 1.0);
+
+        let config = GroupingConfig {
+            cells_per_group: 10,
+            ..GroupingConfig::default()
+        };
+
+        let service = CellGroupingService::new(config);
+        let result = service.group_cells(cells, "TEST-BATCH-001".to_string());
+
+        assert_eq!(result.group_count, 0);
+        assert_eq!(result.groups.len(), 0);
+        assert_eq!(result.avg_consistency_score, 0.0);
+    }
+
+    #[test]
+    fn test_boundary_all_cells_rejected() {
+        let mut cells = generate_test_cells(20, 0.02, 1.0);
+        for cell in &mut cells {
+            cell.capacity_ratio = 0.8;
+            cell.grade = CellGrade::Rejected;
+        }
+
+        let config = GroupingConfig {
+            min_capacity_ratio: 0.85,
+            ..GroupingConfig::default()
+        };
+
+        let service = CellGroupingService::new(config);
+        let result = service.group_cells(cells, "TEST-BATCH-001".to_string());
+
+        assert_eq!(result.rejected_cells, 20);
+        assert_eq!(result.group_count, 0);
+    }
+
+    #[test]
+    fn test_boundary_exact_group_count() {
+        let cells = generate_test_cells(100, 0.02, 1.0);
+
+        let config = GroupingConfig {
+            cells_per_group: 10,
+            ..GroupingConfig::default()
+        };
+
+        let service = CellGroupingService::new(config);
+        let result = service.group_cells(cells, "TEST-BATCH-001".to_string());
+
+        assert_eq!(result.group_count, 10);
+        assert_eq!(result.total_cells, 100);
+    }
+
+    #[test]
+    fn test_consistency_score_edge_cases() {
+        let config = GroupingConfig::default();
+        let service = CellGroupingService::new(config);
+
+        let single_cell = generate_test_cells(1, 0.0, 0.0);
+        let score = service.calculate_group_consistency(&[&single_cell[0]]);
+        assert_eq!(score, 0.0, "Single cell should have 0 consistency score");
+
+        let empty: Vec<&CellInfo> = Vec::new();
+        let score_empty = service.calculate_group_consistency(&empty);
+        assert_eq!(score_empty, 0.0, "Empty cells should have 0 consistency score");
+    }
+
+    #[test]
+    fn test_genetic_algorithm_elitism_preserves_best() {
+        let cells = generate_test_cells(50, 0.03, 1.5);
+
+        let config = GroupingConfig {
+            cells_per_group: 10,
+            algorithm: GroupingAlgorithm::Genetic,
+            genetic_params: GeneticParams {
+                population_size: 30,
+                max_generations: 20,
+                mutation_rate: 0.1,
+                crossover_rate: 0.8,
+                elite_count: 2,
+            },
+            ..GroupingConfig::default()
+        };
+
+        let service = CellGroupingService::new(config);
+        let result = service.group_cells(cells, "TEST-BATCH-001".to_string());
+
+        assert!(result.avg_consistency_score > 70.0,
+            "With elitism, consistency score should be > 70, got {:.2}",
+            result.avg_consistency_score);
+    }
+
+    #[test]
+    fn test_greedy_algorithm_sorts_correctly() {
+        let mut cells = generate_test_cells(20, 0.05, 2.0);
+        cells[0].measured_capacity = RATED_CAPACITY * 0.99;
+        cells[1].measured_capacity = RATED_CAPACITY * 0.85;
+
+        let config = GroupingConfig {
+            cells_per_group: 10,
+            algorithm: GroupingAlgorithm::Greedy,
+            ..GroupingConfig::default()
+        };
+
+        let service = CellGroupingService::new(config);
+        let result = service.group_cells(cells, "TEST-BATCH-001".to_string());
+
+        assert!(result.groups.len() >= 1);
+        if let Some(first_group) = result.groups.first() {
+            assert!(first_group.avg_capacity > RATED_CAPACITY * 0.9,
+                "First group should have higher capacity cells, got {:.4}", first_group.avg_capacity);
+        }
+    }
+}
