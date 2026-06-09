@@ -606,3 +606,693 @@ body {
 ::-webkit-scrollbar-thumb:hover {
     background: #e94560;
 }
+
+/* ============================================
+   新增：顶部导航栏样式
+   ============================================ */
+
+.top-nav {
+    background: #16213e;
+    border-bottom: 1px solid #2a2a4a;
+    padding: 0 20px;
+}
+
+.nav-tabs {
+    display: flex;
+    gap: 5px;
+}
+
+.nav-tab {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 20px;
+    background: none;
+    border: none;
+    color: #888;
+    cursor: pointer;
+    font-size: 14px;
+    border-bottom: 3px solid transparent;
+    transition: all 0.2s;
+}
+
+.nav-tab:hover {
+    color: #eaeaea;
+    background: #ffffff10;
+}
+
+.nav-tab.active {
+    color: #e94560;
+    border-bottom-color: #e94560;
+    background: #e9456010;
+}
+
+.nav-icon {
+    font-size: 18px;
+}
+
+/* ============================================
+   新增：页面内容样式
+   ============================================ */
+
+.page-content {
+    animation: fadeIn 0.3s ease-in;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.page-section {
+    margin-bottom: 25px;
+    padding: 20px;
+    background: #16213e;
+    border-radius: 8px;
+    border: 1px solid #2a2a4a;
+}
+
+.page-section h3 {
+    color: #00d9ff;
+    font-size: 16px;
+    margin-bottom: 15px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #2a2a4a;
+}
+
+/* ============================================
+   新增：表单样式
+   ============================================ */
+
+.form-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+}
+
+.form-item {
+    display: flex;
+    flex-direction: column;
+}
+
+.form-item label {
+    font-size: 12px;
+    color: #888;
+    margin-bottom: 6px;
+}
+
+.form-item input,
+.form-item select {
+    padding: 10px 12px;
+    background: #0f0f20;
+    border: 1px solid #333;
+    border-radius: 4px;
+    color: #eaeaea;
+    font-size: 14px;
+    transition: border-color 0.2s;
+}
+
+.form-item input:focus,
+.form-item select:focus {
+    outline: none;
+    border-color: #e94560;
+}
+
+.btn-primary {
+    background: linear-gradient(135deg, #e94560, #ff6680);
+    border-color: #e94560;
+    color: white;
+    font-weight: 500;
+}
+
+.btn-primary:hover {
+    background: linear-gradient(135deg, #ff6680, #ff88a0);
+    border-color: #ff6680;
+}
+
+.btn-sm {
+    padding: 4px 12px;
+    font-size: 12px;
+}
+
+/* ============================================
+   新增：结果摘要样式
+   ============================================ */
+
+.result-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 15px;
+    padding: 20px;
+    background: linear-gradient(135deg, #0f3460, #16213e);
+    border-radius: 8px;
+    margin-bottom: 20px;
+    border: 1px solid #e9456040;
+}
+
+.summary-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.summary-item .label {
+    font-size: 12px;
+    color: #888;
+    margin-bottom: 6px;
+}
+
+.summary-item .value {
+    font-size: 24px;
+    font-weight: bold;
+    color: #00d9ff;
+}
+
+.summary-item .value.good {
+    color: #10b981;
+}
+
+.summary-item .value.warning {
+    color: #f59e0b;
+}
+
+.summary-item .value.danger {
+    color: #ef4444;
+}
+
+/* ============================================
+   新增：分组卡片样式
+   ============================================ */
+
+.groups-container {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 15px;
+}
+
+.group-card {
+    background: #0f0f20;
+    border-radius: 8px;
+    padding: 15px;
+    border: 1px solid #333;
+    transition: all 0.2s;
+}
+
+.group-card:hover {
+    border-color: #e94560;
+    transform: translateY(-2px);
+}
+
+.group-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #333;
+}
+
+.group-card-title {
+    font-weight: 600;
+    color: #e94560;
+}
+
+.group-score {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+.group-score.excellent {
+    color: #10b981;
+}
+
+.group-score.good {
+    color: #3b82f6;
+}
+
+.group-score.fair {
+    color: #f59e0b;
+}
+
+.group-card-stats {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+    margin-bottom: 10px;
+    font-size: 12px;
+}
+
+.group-card-stats .stat {
+    display: flex;
+    justify-content: space-between;
+    color: #888;
+}
+
+.group-card-stats .stat span:last-child {
+    color: #00d9ff;
+    font-weight: 500;
+}
+
+.group-cells {
+    max-height: 120px;
+    overflow-y: auto;
+    font-size: 11px;
+}
+
+.group-cell-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 6px;
+    background: #16213e;
+    border-radius: 3px;
+    margin-bottom: 3px;
+}
+
+.group-cell-item .cell-id {
+    color: #888;
+}
+
+.group-cell-item .cell-specs {
+    color: #00d9ff;
+}
+
+/* ============================================
+   新增：数据表格样式
+   ============================================ */
+
+.table-container {
+    overflow-x: auto;
+    background: #0f0f20;
+    border-radius: 6px;
+}
+
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.data-table thead {
+    background: #16213e;
+}
+
+.data-table th {
+    padding: 12px 15px;
+    text-align: left;
+    color: #00d9ff;
+    font-weight: 500;
+    border-bottom: 2px solid #333;
+    white-space: nowrap;
+}
+
+.data-table td {
+    padding: 12px 15px;
+    border-bottom: 1px solid #2a2a4a;
+    color: #ccc;
+}
+
+.data-table tbody tr:hover {
+    background: #ffffff08;
+}
+
+.data-table .action-btn {
+    padding: 4px 10px;
+    margin-right: 5px;
+    font-size: 11px;
+}
+
+.badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+.badge-success {
+    background: #10b98120;
+    color: #10b981;
+}
+
+.badge-warning {
+    background: #f59e0b20;
+    color: #f59e0b;
+}
+
+.badge-danger {
+    background: #ef444420;
+    color: #ef4444;
+}
+
+.badge-info {
+    background: #3b82f620;
+    color: #3b82f6;
+}
+
+/* ============================================
+   新增：老化模式识别样式
+   ============================================ */
+
+.section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.degradation-content {
+    padding: 15px;
+    background: #0f346040;
+    border-radius: 8px;
+}
+
+.degradation-mode-card {
+    display: grid;
+    grid-template-columns: 150px 1fr auto;
+    gap: 15px;
+    align-items: center;
+    padding: 15px;
+    background: #16213e;
+    border-radius: 8px;
+    margin-bottom: 15px;
+    border-left: 4px solid #e94560;
+}
+
+.degradation-mode-card.normal {
+    border-left-color: #10b981;
+}
+
+.degradation-mode-card.cathode {
+    border-left-color: #e94560;
+}
+
+.degradation-mode-card.anode {
+    border-left-color: #f59e0b;
+}
+
+.degradation-mode-card.electrolyte {
+    border-left-color: #8b5cf6;
+}
+
+.degradation-mode-card.sei {
+    border-left-color: #3b82f6;
+}
+
+.degradation-mode-card.mixed {
+    border-left-color: #ef4444;
+}
+
+.degradation-mode-info .mode-name {
+    font-size: 18px;
+    font-weight: bold;
+    margin-bottom: 4px;
+}
+
+.degradation-mode-info .mode-desc {
+    font-size: 12px;
+    color: #888;
+}
+
+.confidence-bar {
+    height: 8px;
+    background: #2a2a4a;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 5px;
+}
+
+.confidence-bar-fill {
+    height: 100%;
+    transition: width 0.5s ease;
+}
+
+.confidence-value {
+    text-align: right;
+    font-size: 20px;
+    font-weight: bold;
+    color: #00d9ff;
+}
+
+.mode-scores {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+    margin-top: 15px;
+}
+
+.mode-score-item {
+    padding: 10px;
+    background: #0f0f20;
+    border-radius: 6px;
+    text-align: center;
+}
+
+.mode-score-item .score-name {
+    font-size: 11px;
+    color: #888;
+    margin-bottom: 5px;
+}
+
+.mode-score-item .score-value {
+    font-size: 16px;
+    font-weight: bold;
+}
+
+.dvdq-chart-container {
+    margin-top: 20px;
+    padding: 15px;
+    background: #0a0a1a;
+    border-radius: 6px;
+}
+
+.dvdq-chart-container h5 {
+    color: #888;
+    font-size: 13px;
+    margin-bottom: 10px;
+}
+
+.recommendations {
+    margin-top: 15px;
+    padding: 12px;
+    background: #f59e0b10;
+    border-radius: 6px;
+    border-left: 3px solid #f59e0b;
+}
+
+.recommendations h5 {
+    color: #f59e0b;
+    font-size: 13px;
+    margin-bottom: 8px;
+}
+
+.recommendations ul {
+    margin: 0;
+    padding-left: 20px;
+    font-size: 12px;
+    color: #ccc;
+}
+
+.recommendations li {
+    margin-bottom: 4px;
+}
+
+/* ============================================
+   新增：MES追溯样式
+   ============================================ */
+
+.batch-detail-tabs {
+    display: flex;
+    gap: 5px;
+    margin-bottom: 15px;
+    border-bottom: 1px solid #333;
+}
+
+.tab-btn {
+    padding: 10px 20px;
+    background: none;
+    border: none;
+    color: #888;
+    cursor: pointer;
+    font-size: 13px;
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s;
+}
+
+.tab-btn:hover {
+    color: #eaeaea;
+}
+
+.tab-btn.active {
+    color: #e94560;
+    border-bottom-color: #e94560;
+}
+
+.tab-content {
+    animation: fadeIn 0.3s ease;
+}
+
+.sync-status-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+    margin-bottom: 20px;
+}
+
+.sync-status-item {
+    padding: 15px;
+    background: #0f0f20;
+    border-radius: 8px;
+    border: 1px solid #333;
+}
+
+.sync-status-item .status-label {
+    font-size: 12px;
+    color: #888;
+    margin-bottom: 8px;
+}
+
+.sync-status-item .status-value {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.sync-status-item .status-indicator {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+}
+
+.sync-status-item .status-indicator.synced {
+    background: #10b981;
+    box-shadow: 0 0 8px #10b981;
+}
+
+.sync-status-item .status-indicator.pending {
+    background: #f59e0b;
+    animation: pulse 1.5s infinite;
+}
+
+.sync-status-item .status-indicator.failed {
+    background: #ef4444;
+}
+
+.sync-status-item .status-time {
+    font-size: 11px;
+    color: #666;
+    margin-top: 5px;
+}
+
+.sync-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.optimization-details {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 15px;
+}
+
+.optimization-detail-card {
+    padding: 15px;
+    background: #0f0f20;
+    border-radius: 8px;
+    border: 1px solid #333;
+}
+
+.optimization-detail-card h5 {
+    color: #00d9ff;
+    font-size: 13px;
+    margin-bottom: 10px;
+}
+
+.optimization-detail-card .detail-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    font-size: 12px;
+    border-bottom: 1px solid #2a2a4a;
+}
+
+.optimization-detail-card .detail-item:last-child {
+    border-bottom: none;
+}
+
+.optimization-detail-card .detail-item .label {
+    color: #888;
+}
+
+.optimization-detail-card .detail-item .value {
+    font-weight: 500;
+}
+
+.chart-controls {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+    align-items: center;
+}
+
+.chart-controls label {
+    font-size: 12px;
+    color: #888;
+}
+
+.status-tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+.status-running {
+    background: #3b82f620;
+    color: #3b82f6;
+}
+
+.status-completed {
+    background: #10b98120;
+    color: #10b981;
+}
+
+.status-paused {
+    background: #f59e0b20;
+    color: #f59e0b;
+}
+
+.status-error {
+    background: #ef444420;
+    color: #ef4444;
+}
+
+.loading-indicator {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid #333;
+    border-top-color: #e94560;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.empty-state {
+    text-align: center;
+    padding: 40px;
+    color: #666;
+    font-size: 14px;
+}
+
+.empty-state-icon {
+    font-size: 48px;
+    margin-bottom: 15px;
+    opacity: 0.3;
+}

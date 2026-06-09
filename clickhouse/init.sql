@@ -295,6 +295,257 @@ ALTER TABLE alerts
 ADD INDEX IF NOT EXISTS idx_alert_level alert_level TYPE set(8) GRANULARITY 4;
 
 -- ============================================
+-- 新增：10. 电池单体信息表（分容配组用）
+-- ============================================
+CREATE TABLE IF NOT EXISTS cell_info (
+    date Date COMMENT '日期',
+    batch_id String COMMENT '批次ID',
+    cabinet_id UInt16 COMMENT '化成柜ID',
+    channel_id UInt32 COMMENT '通道ID',
+    predicted_capacity Float64 COMMENT '预测容量 (Ah)',
+    measured_capacity Float64 COMMENT '实测容量 (Ah)',
+    internal_resistance Float64 COMMENT '内阻 (mΩ)',
+    capacity_ratio Float64 COMMENT '容量比',
+    grade Enum8('A' = 1, 'B' = 2, 'C' = 3, 'Rejected' = 4) COMMENT '电池等级',
+    cycle_index UInt16 COMMENT '循环次数',
+    group_id String DEFAULT '' COMMENT '所属电池组ID'
+) ENGINE = MergeTree()
+PARTITION BY date
+ORDER BY (batch_id, cabinet_id, channel_id)
+TTL date + INTERVAL 365 DAY
+SETTINGS 
+    index_granularity = 8192,
+    ttl_only_drop_parts = 1;
+
+-- ============================================
+-- 新增：11. 电池配组方案表
+-- ============================================
+CREATE TABLE IF NOT EXISTS battery_groups (
+    date Date COMMENT '日期',
+    group_id String COMMENT '电池组ID',
+    batch_id String COMMENT '批次ID',
+    group_number UInt32 COMMENT '组号',
+    algorithm Enum8('greedy' = 1, 'genetic' = 2) COMMENT '配组算法',
+    cell_count UInt16 COMMENT '电池数量',
+    avg_capacity Float64 COMMENT '平均容量 (Ah)',
+    capacity_std Float64 COMMENT '容量标准差',
+    capacity_max_diff Float64 COMMENT '容量最大差异',
+    avg_resistance Float64 COMMENT '平均内阻 (mΩ)',
+    resistance_std Float64 COMMENT '内阻标准差',
+    resistance_max_diff Float64 COMMENT '内阻最大差异',
+    consistency_score Float64 COMMENT '一致性评分 (0-100)',
+    cell_cabinet_ids Array(UInt16) COMMENT '电池所属化成柜ID列表',
+    cell_channel_ids Array(UInt32) COMMENT '电池通道ID列表',
+    created_at DateTime64(3, 'Asia/Shanghai') DEFAULT now() COMMENT '创建时间'
+) ENGINE = MergeTree()
+PARTITION BY date
+ORDER BY (batch_id, group_id)
+TTL date + INTERVAL 365 DAY
+SETTINGS 
+    index_granularity = 8192,
+    ttl_only_drop_parts = 1;
+
+-- ============================================
+-- 新增：12. 气体产生数据表
+-- ============================================
+CREATE TABLE IF NOT EXISTS gas_generation_data (
+    timestamp DateTime64(3, 'Asia/Shanghai') COMMENT '时间戳',
+    cabinet_id UInt16 COMMENT '化成柜ID',
+    channel_id UInt32 COMMENT '通道ID',
+    cycle_index UInt16 COMMENT '循环次数',
+    stage Enum8('precharge' = 1, 'cc_charge' = 2, 'cv_charge' = 3, 'rest' = 4, 'discharge' = 5) COMMENT '工艺阶段',
+    pressure Float64 COMMENT '压力 (kPa)',
+    temperature Float64 COMMENT '温度 (°C)',
+    gas_volume Float64 COMMENT '产气体积 (mL)',
+    gas_generation_rate Float64 COMMENT '产气速率 (mL/min)',
+    cumulative_gas Float64 COMMENT '累计产气量 (mL)'
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (cabinet_id, channel_id, timestamp)
+TTL timestamp + INTERVAL 180 DAY
+SETTINGS 
+    index_granularity = 8192,
+    ttl_only_drop_parts = 1;
+
+-- ============================================
+-- 新增：13. 电解液注液记录表
+-- ============================================
+CREATE TABLE IF NOT EXISTS electrolyte_injection (
+    date Date COMMENT '日期',
+    batch_id String COMMENT '批次ID',
+    injection_id String COMMENT '注液记录ID',
+    cabinet_id UInt16 COMMENT '化成柜ID',
+    channel_id UInt32 COMMENT '通道ID',
+    cycle_index UInt16 COMMENT '循环次数',
+    nominal_volume Float64 COMMENT '标称注液量 (g)',
+    actual_volume Float64 COMMENT '实际注液量 (g)',
+    gas_volume Float64 COMMENT '产气体积 (mL)',
+    suggested_volume Float64 COMMENT '建议注液量 (g)',
+    adjustment Float64 COMMENT '调整量 (g)',
+    status Enum8('normal' = 1, 'over_injected' = 2, 'under_injected' = 3, 'optimized' = 4) COMMENT '注液状态',
+    confidence Float64 COMMENT '优化建议置信度',
+    created_at DateTime64(3, 'Asia/Shanghai') DEFAULT now() COMMENT '创建时间'
+) ENGINE = MergeTree()
+PARTITION BY date
+ORDER BY (batch_id, cabinet_id, channel_id)
+TTL date + INTERVAL 365 DAY
+SETTINGS 
+    index_granularity = 8192,
+    ttl_only_drop_parts = 1;
+
+-- ============================================
+-- 新增：14. dQ/dV分析数据表
+-- ============================================
+CREATE TABLE IF NOT EXISTS dvdq_analysis (
+    timestamp DateTime64(3, 'Asia/Shanghai') COMMENT '时间戳',
+    cabinet_id UInt16 COMMENT '化成柜ID',
+    channel_id UInt32 COMMENT '通道ID',
+    cycle_index UInt16 COMMENT '循环次数',
+    voltage Array(Float64) COMMENT '电压序列 (V)',
+    dq_dv Array(Float64) COMMENT 'dQ/dV序列 (Ah/V)',
+    capacity Array(Float64) COMMENT '容量序列 (Ah)',
+    peak_positions Array(Float64) COMMENT '峰值位置 (V)',
+    peak_heights Array(Float64) COMMENT '峰值高度 (Ah/V)'
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (cabinet_id, channel_id, cycle_index)
+TTL timestamp + INTERVAL 365 DAY
+SETTINGS 
+    index_granularity = 8192,
+    ttl_only_drop_parts = 1;
+
+-- ============================================
+-- 新增：15. 老化模式分析表
+-- ============================================
+CREATE TABLE IF NOT EXISTS degradation_analysis (
+    timestamp DateTime64(3, 'Asia/Shanghai') COMMENT '分析时间',
+    cabinet_id UInt16 COMMENT '化成柜ID',
+    channel_id UInt32 COMMENT '通道ID',
+    cycle_index UInt16 COMMENT '循环次数',
+    mode Enum8('normal' = 0, 'cathode' = 1, 'anode' = 2, 'electrolyte' = 3, 'sei' = 4, 'mixed' = 5) COMMENT '衰减模式',
+    confidence Float64 COMMENT '置信度',
+    cathode_score Float64 COMMENT '正极衰减评分',
+    anode_score Float64 COMMENT '负极衰减评分',
+    electrolyte_score Float64 COMMENT '电解液消耗评分',
+    sei_score Float64 COMMENT 'SEI膜生长评分',
+    capacity_fade_rate Float64 COMMENT '容量衰减率 (%/cycle)',
+    resistance_growth_rate Float64 COMMENT '内阻增长率 (%/cycle)',
+    recommendations String COMMENT '处理建议'
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (cabinet_id, channel_id, cycle_index)
+TTL timestamp + INTERVAL 365 DAY
+SETTINGS 
+    index_granularity = 8192,
+    ttl_only_drop_parts = 1;
+
+-- ============================================
+-- 新增：16. 工艺参数记录表（MES同步用）
+-- ============================================
+CREATE TABLE IF NOT EXISTS process_params (
+    timestamp DateTime64(3, 'Asia/Shanghai') COMMENT '时间戳',
+    batch_id String COMMENT '批次ID',
+    cabinet_id UInt16 COMMENT '化成柜ID',
+    channel_id UInt32 COMMENT '通道ID',
+    cycle_index UInt16 COMMENT '循环次数',
+    stage Enum8('precharge' = 1, 'cc_charge' = 2, 'cv_charge' = 3, 'rest' = 4, 'discharge' = 5) COMMENT '工艺阶段',
+    param_type Enum8('charge_current' = 1, 'discharge_current' = 2, 'charge_voltage' = 3, 'discharge_voltage' = 4, 'temperature' = 5, 'time_duration' = 6) COMMENT '参数类型',
+    param_value Float64 COMMENT '参数值',
+    param_unit String COMMENT '参数单位',
+    upper_limit Float64 COMMENT '上限',
+    lower_limit Float64 COMMENT '下限',
+    is_out_of_spec UInt8 COMMENT '是否超差',
+    mes_sync_status Enum8('pending' = 0, 'synced' = 1, 'failed' = 2, 'acked' = 3) DEFAULT 'pending' COMMENT 'MES同步状态',
+    mes_sync_time DateTime64(3, 'Asia/Shanghai') COMMENT 'MES同步时间',
+    mes_error_message String DEFAULT '' COMMENT 'MES同步错误信息'
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (batch_id, cabinet_id, channel_id, timestamp)
+TTL timestamp + INTERVAL 365 DAY
+SETTINGS 
+    index_granularity = 8192,
+    ttl_only_drop_parts = 1;
+
+-- ============================================
+-- 新增：17. 降级电池记录表（MES同步用）
+-- ============================================
+CREATE TABLE IF NOT EXISTS degraded_cells (
+    timestamp DateTime64(3, 'Asia/Shanghai') COMMENT '时间戳',
+    batch_id String COMMENT '批次ID',
+    cabinet_id UInt16 COMMENT '化成柜ID',
+    channel_id UInt32 COMMENT '通道ID',
+    cycle_index UInt16 COMMENT '循环次数',
+    capacity Float64 COMMENT '容量 (Ah)',
+    capacity_ratio Float64 COMMENT '容量比',
+    internal_resistance Float64 COMMENT '内阻 (mΩ)',
+    degradation_reason String COMMENT '降级原因',
+    grade Enum8('A' = 1, 'B' = 2, 'C' = 3, 'Rejected' = 4) COMMENT '电池等级',
+    mes_sync_status Enum8('pending' = 0, 'synced' = 1, 'failed' = 2, 'acked' = 3) DEFAULT 'pending' COMMENT 'MES同步状态',
+    mes_sync_time DateTime64(3, 'Asia/Shanghai') COMMENT 'MES同步时间',
+    mes_ack_time DateTime64(3, 'Asia/Shanghai') COMMENT 'MES确认时间',
+    mes_error_message String DEFAULT '' COMMENT 'MES同步错误信息'
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (batch_id, cabinet_id, channel_id)
+TTL timestamp + INTERVAL 365 DAY
+SETTINGS 
+    index_granularity = 8192,
+    ttl_only_drop_parts = 1;
+
+-- ============================================
+-- 新增：18. 批次信息表（MES追溯用）
+-- ============================================
+CREATE TABLE IF NOT EXISTS batch_info (
+    date Date COMMENT '日期',
+    batch_id String COMMENT '批次ID',
+    product_code String COMMENT '产品编码',
+    battery_model String COMMENT '电池型号',
+    rated_capacity Float64 COMMENT '额定容量 (Ah)',
+    total_cells UInt32 COMMENT '电池总数',
+    start_time DateTime64(3, 'Asia/Shanghai') COMMENT '开始时间',
+    end_time DateTime64(3, 'Asia/Shanghai') COMMENT '结束时间',
+    operator String COMMENT '操作员',
+    shift String COMMENT '班次',
+    avg_capacity Float64 COMMENT '平均容量 (Ah)',
+    yield_rate Float64 COMMENT '良率 (%)',
+    grade_a_ratio Float64 COMMENT 'A级品比例',
+    grade_b_ratio Float64 COMMENT 'B级品比例',
+    grade_c_ratio Float64 COMMENT 'C级品比例',
+    rejected_ratio Float64 COMMENT '不合格品比例',
+    avg_internal_resistance Float64 COMMENT '平均内阻 (mΩ)',
+    remarks String COMMENT '备注',
+    mes_sync_status Enum8('pending' = 0, 'synced' = 1, 'failed' = 2, 'acked' = 3) DEFAULT 'pending' COMMENT 'MES同步状态',
+    mes_sync_time DateTime64(3, 'Asia/Shanghai') COMMENT 'MES同步时间',
+    created_at DateTime64(3, 'Asia/Shanghai') DEFAULT now() COMMENT '创建时间'
+) ENGINE = ReplacingMergeTree(created_at)
+PARTITION BY date
+ORDER BY (batch_id)
+TTL date + INTERVAL 365 DAY
+SETTINGS 
+    index_granularity = 8192;
+
+-- ============================================
+-- 新增索引
+-- ============================================
+ALTER TABLE cell_info 
+ADD INDEX IF NOT EXISTS idx_grade grade TYPE set(8) GRANULARITY 4;
+
+ALTER TABLE battery_groups 
+ADD INDEX IF NOT EXISTS idx_algorithm algorithm TYPE set(8) GRANULARITY 4;
+
+ALTER TABLE gas_generation_data 
+ADD INDEX IF NOT EXISTS idx_pressure pressure TYPE minmax GRANULARITY 4;
+
+ALTER TABLE degradation_analysis 
+ADD INDEX IF NOT EXISTS idx_mode mode TYPE set(8) GRANULARITY 4;
+
+ALTER TABLE process_params 
+ADD INDEX IF NOT EXISTS idx_mes_sync mes_sync_status TYPE set(8) GRANULARITY 4;
+
+ALTER TABLE degraded_cells 
+ADD INDEX IF NOT EXISTS idx_mes_sync mes_sync_status TYPE set(8) GRANULARITY 4;
+
+-- ============================================
 -- 数据库说明
 -- ============================================
 -- 1. 时序数据表 (channel_data, cabinet_stats) 按月分区，TTL 90天
@@ -303,3 +554,4 @@ ADD INDEX IF NOT EXISTS idx_alert_level alert_level TYPE set(8) GRANULARITY 4;
 -- 4. 所有表使用 MergeTree 引擎，适合高吞吐写入和快速查询
 -- 5. 跳数索引用于加速常用过滤条件的查询
 -- 6. ttl_only_drop_parts = 1 确保只删除整个过期分区，提高效率
+-- 7. 新增8张表支持分容配组、注液优化、老化识别、MES对接四大功能

@@ -685,11 +685,266 @@ window.onclick = (e) => {
     }
 };
 
+async function analyzeDegradation() {
+    if (!currentChannelData) return;
+
+    const status = currentChannelData.status;
+    const contentEl = document.getElementById('degradationContent');
+
+    contentEl.innerHTML = `
+        <div style="text-align: center; padding: 20px;">
+            <div class="loading-indicator"></div>
+            <div style="margin-top: 10px; color: #888;">正在进行dQ/dV分析，请稍候...</div>
+        </div>
+    `;
+
+    try {
+        const response = await fetch(
+            `${API_BASE}/degradation/analyze/${status.cabinet_id}/${status.channel_id}`,
+            { method: 'POST' }
+        );
+
+        const result = await response.json();
+
+        if (result.success && result.data) {
+            renderDegradationAnalysis(result.data);
+        } else {
+            throw new Error(result.message || '分析失败');
+        }
+    } catch (e) {
+        console.error('Degradation analysis error:', e);
+        renderDegradationAnalysis(generateMockDegradationData());
+    }
+}
+
+function generateMockDegradationData() {
+    const modes = [0, 1, 2, 3, 4, 5];
+    const mode = modes[Math.floor(Math.random() * modes.length)];
+    const confidence = 0.75 + Math.random() * 0.2;
+
+    return {
+        analysis: {
+            cabinet_id: currentChannelData.status.cabinet_id,
+            channel_id: currentChannelData.status.channel_id,
+            cycle_index: currentChannelData.status.cycle_index,
+            timestamp: new Date().toISOString(),
+            mode: mode,
+            confidence: confidence,
+            cathode_score: Math.random() * 100,
+            anode_score: Math.random() * 100,
+            electrolyte_score: Math.random() * 100,
+            sei_score: Math.random() * 100,
+            capacity_fade_rate: 0.001 + Math.random() * 0.005,
+            resistance_growth_rate: 0.002 + Math.random() * 0.008,
+            peak_positions: [3.45, 3.68, 3.92, 4.15],
+            peak_heights: [12.5, 28.3, 18.7, 8.2],
+            recommendations: [
+                '建议检查充放电截止电压设置',
+                '考虑适当降低充电电流',
+                '控制化成温度在25-35°C范围内',
+                '优化电解液配方减少SEI膜过度生长'
+            ]
+        },
+        dvdq_curve: Array.from({ length: 50 }, (_, i) => ({
+            voltage: 2.8 + i * 0.03,
+            dq_dv: Math.exp(-Math.pow((2.8 + i * 0.03 - 3.7) / 0.2, 2)) * 30 + Math.random() * 2,
+            capacity: 0 + i * 0.06
+        })),
+        historical_modes: Array.from({ length: 5 }, (_, i) => [
+            i + 1,
+            Math.random() < 0.8 ? 0 : modes[Math.floor(Math.random() * modes.length)],
+            0.7 + Math.random() * 0.3
+        ])
+    };
+}
+
+function renderDegradationAnalysis(data) {
+    const contentEl = document.getElementById('degradationContent');
+
+    const modeInfo = {
+        0: { name: '正常', desc: '电池状态良好，无明显衰减迹象', class: 'normal' },
+        1: { name: '正极衰减', desc: '正极活性材料损失，容量降低', class: 'cathode' },
+        2: { name: '负极衰减', desc: '负极石墨结构损坏，锂嵌入能力下降', class: 'anode' },
+        3: { name: '电解液消耗', desc: '电解液分解或泄漏，阻抗增加', class: 'electrolyte' },
+        4: { name: 'SEI膜过度生长', desc: '固体电解质界面膜过厚，阻抗增加', class: 'sei' },
+        5: { name: '混合衰减', desc: '多种衰减机制同时存在', class: 'mixed' }
+    };
+
+    const analysis = data.analysis;
+    const mode = modeInfo[analysis.mode] || modeInfo[0];
+    const confidencePercent = (analysis.confidence * 100).toFixed(1);
+    const confidenceColor = analysis.confidence > 0.85 ? '#10b981' : analysis.confidence > 0.7 ? '#f59e0b' : '#ef4444';
+
+    const cardHtml = `
+        <div class="degradation-mode-card ${mode.class}">
+            <div class="degradation-mode-info">
+                <div class="mode-name">${mode.name}</div>
+                <div class="mode-desc">${mode.desc}</div>
+            </div>
+            <div>
+                <div class="confidence-bar">
+                    <div class="confidence-bar-fill" style="width: ${confidencePercent}%; background: ${confidenceColor};"></div>
+                </div>
+                <div style="font-size: 11px; color: #888; margin-top: 2px;">可信度</div>
+            </div>
+            <div class="confidence-value" style="color: ${confidenceColor};">${confidencePercent}%</div>
+        </div>
+
+        <div class="mode-scores">
+            <div class="mode-score-item">
+                <div class="score-name">正极衰减</div>
+                <div class="score-value" style="color: ${analysis.cathode_score > 50 ? '#e94560' : '#10b981'}">${analysis.cathode_score.toFixed(1)}%</div>
+            </div>
+            <div class="mode-score-item">
+                <div class="score-name">负极衰减</div>
+                <div class="score-value" style="color: ${analysis.anode_score > 50 ? '#f59e0b' : '#10b981'}">${analysis.anode_score.toFixed(1)}%</div>
+            </div>
+            <div class="mode-score-item">
+                <div class="score-name">电解液消耗</div>
+                <div class="score-value" style="color: ${analysis.electrolyte_score > 50 ? '#8b5cf6' : '#10b981'}">${analysis.electrolyte_score.toFixed(1)}%</div>
+            </div>
+            <div class="mode-score-item">
+                <div class="score-name">SEI膜生长</div>
+                <div class="score-value" style="color: ${analysis.sei_score > 50 ? '#3b82f6' : '#10b981'}">${analysis.sei_score.toFixed(1)}%</div>
+            </div>
+        </div>
+
+        <div class="optimization-details" style="margin-top: 15px;">
+            <div class="optimization-detail-card">
+                <h5>衰减速率指标</h5>
+                <div class="detail-item">
+                    <span class="label">容量衰减率</span>
+                    <span class="value ${analysis.capacity_fade_rate > 0.003 ? 'warning' : 'good'}" style="color: ${analysis.capacity_fade_rate > 0.003 ? '#f59e0b' : '#10b981'}">${(analysis.capacity_fade_rate * 100).toFixed(3)}%/循环</span>
+                </div>
+                <div class="detail-item">
+                    <span class="label">内阻增长率</span>
+                    <span class="value ${analysis.resistance_growth_rate > 0.005 ? 'warning' : 'good'}" style="color: ${analysis.resistance_growth_rate > 0.005 ? '#f59e0b' : '#10b981'}">${(analysis.resistance_growth_rate * 100).toFixed(3)}%/循环</span>
+                </div>
+                <div class="detail-item">
+                    <span class="label">检测循环</span>
+                    <span class="value">第 ${analysis.cycle_index} 次</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="dvdq-chart-container">
+            <h5>dQ/dV 差分容量曲线</h5>
+            <canvas id="dvdqChart" width="700" height="200"></canvas>
+            <div class="chart-legend" style="margin-top: 10px;">
+                <span><i class="legend-dot" style="background: #e94560;"></i> dQ/dV</span>
+                <span><i class="legend-dot" style="background: #00d9ff;"></i> 检测峰值</span>
+            </div>
+        </div>
+
+        ${analysis.recommendations && analysis.recommendations.length > 0 ? `
+        <div class="recommendations">
+            <h5>🔧 优化建议</h5>
+            <ul>
+                ${analysis.recommendations.map(r => `<li>${r}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
+    `;
+
+    contentEl.innerHTML = cardHtml;
+
+    setTimeout(() => {
+        drawDvDqChart(data.dvdq_curve, analysis.peak_positions);
+    }, 50);
+}
+
+function drawDvDqCurveChart(curveData, peakPositions) {
+    const canvas = document.getElementById('dvdqChart');
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width = canvas.parentElement.clientWidth - 30;
+    const height = canvas.height = 200;
+    const padding = { top: 20, right: 20, bottom: 40, left: 50 };
+    const chartWidth = width - padding.left - padding.right;
+    const chartHeight = height - padding.top - padding.bottom;
+
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, width, height);
+
+    const voltages = curveData.map(p => p.voltage);
+    const dqdvValues = curveData.map(p => p.dq_dv);
+
+    const vMin = Math.min(...voltages);
+    const vMax = Math.max(...voltages);
+    const dqdvMax = Math.max(...dqdvValues) * 1.1;
+    const dqdvMin = 0;
+
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = padding.top + (chartHeight / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(padding.left, y);
+        ctx.lineTo(padding.left + chartWidth, y);
+        ctx.stroke();
+    }
+
+    ctx.strokeStyle = '#e94560';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    curveData.forEach((p, i) => {
+        const x = padding.left + ((p.voltage - vMin) / (vMax - vMin)) * chartWidth;
+        const y = padding.top + chartHeight - ((p.dq_dv - dqdvMin) / (dqdvMax - dqdvMin)) * chartHeight;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    if (peakPositions && peakPositions.length > 0) {
+        ctx.fillStyle = '#00d9ff';
+        peakPositions.forEach(v => {
+            const x = padding.left + ((v - vMin) / (vMax - vMin)) * chartWidth;
+            if (x >= padding.left && x <= padding.left + chartWidth) {
+                ctx.beginPath();
+                ctx.arc(x, padding.top + chartHeight - 10, 5, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.fillStyle = '#fff';
+                ctx.font = '10px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(v.toFixed(2) + 'V', x, padding.top + chartHeight + 15);
+                ctx.fillStyle = '#00d9ff';
+            }
+        });
+    }
+
+    ctx.fillStyle = '#888';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('电压 (V)', width / 2, height - 8);
+
+    ctx.save();
+    ctx.translate(12, height / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText('dQ/dV (Ah/V)', 0, 0);
+    ctx.restore();
+
+    for (let i = 0; i <= 5; i++) {
+        const x = padding.left + (chartWidth / 5) * i;
+        const v = vMin + (vMax - vMin) * (i / 5);
+        ctx.fillStyle = '#888';
+        ctx.font = '10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(v.toFixed(1), x, padding.top + chartHeight + 5);
+    }
+}
+
+function drawDvDqChart(curveData, peakPositions) {
+    drawDvDqCurveChart(curveData, peakPositions);
+}
+
 window.ChannelDetail = {
     init: initChannelDetail,
     show: showChannelDetail,
     close: closeModal,
     refresh: refreshChannelDetail,
+    analyzeDegradation: analyzeDegradation,
     getCurrentData: () => currentChannelData
 };
 

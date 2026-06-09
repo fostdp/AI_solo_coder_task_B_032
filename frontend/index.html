@@ -8,7 +8,7 @@
 </head>
 <body>
     <header class="header">
-        <h1>锂电池化成工艺监控与容量预测系统</h1>
+        <h1>锂电池化成工艺监控与容量预测系统 v1.1.0</h1>
         <div class="header-stats" id="systemStats">
             <div class="stat-item">
                 <span class="stat-label">总化成柜</span>
@@ -29,8 +29,29 @@
         </div>
     </header>
 
+    <nav class="top-nav">
+        <div class="nav-tabs">
+            <button class="nav-tab active" data-page="monitor" onclick="switchPage('monitor')">
+                <span class="nav-icon">📊</span>
+                <span>实时监控</span>
+            </button>
+            <button class="nav-tab" data-page="grouping" onclick="switchPage('grouping')">
+                <span class="nav-icon">🔋</span>
+                <span>分容配组</span>
+            </button>
+            <button class="nav-tab" data-page="electrolyte" onclick="switchPage('electrolyte')">
+                <span class="nav-icon">💧</span>
+                <span>电解液优化</span>
+            </button>
+            <button class="nav-tab" data-page="mes" onclick="switchPage('mes')">
+                <span class="nav-icon">🏭</span>
+                <span>MES追溯</span>
+            </button>
+        </div>
+    </nav>
+
     <div class="main-container">
-        <aside class="sidebar">
+        <aside class="sidebar" id="monitorSidebar">
             <h3>化成柜列表</h3>
             <div class="cabinet-list" id="cabinetList"></div>
             
@@ -65,25 +86,257 @@
         </aside>
 
         <main class="content">
-            <div class="panel-header">
-                <h2 id="currentCabinetTitle">化成柜 0 - 实时监控</h2>
-                <div class="panel-controls">
-                    <button class="btn" onclick="refreshPanel()">刷新</button>
-                    <button class="btn" onclick="toggleAutoRefresh()">
-                        <span id="autoRefreshText">自动刷新: 开</span>
-                    </button>
+            <div class="page-content" id="page-monitor">
+                <div class="panel-header">
+                    <h2 id="currentCabinetTitle">化成柜 0 - 实时监控</h2>
+                    <div class="panel-controls">
+                        <button class="btn" onclick="refreshPanel()">刷新</button>
+                        <button class="btn" onclick="toggleAutoRefresh()">
+                            <span id="autoRefreshText">自动刷新: 开</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="cabinet-stats-bar" id="cabinetStats"></div>
+
+                <div class="canvas-container">
+                    <canvas id="cabinetCanvas" width="1200" height="1200"></canvas>
+                    <div class="canvas-overlay" id="canvasOverlay"></div>
+                </div>
+
+                <div class="panel-info">
+                    <p>提示：点击任意通道色块查看详细信息和充放电曲线</p>
                 </div>
             </div>
 
-            <div class="cabinet-stats-bar" id="cabinetStats"></div>
+            <div class="page-content" id="page-grouping" style="display:none;">
+                <div class="panel-header">
+                    <h2>分容配组优化</h2>
+                    <div class="panel-controls">
+                        <button class="btn" onclick="CellGrouping.loadGroupingList()">刷新列表</button>
+                    </div>
+                </div>
 
-            <div class="canvas-container">
-                <canvas id="cabinetCanvas" width="1200" height="1200"></canvas>
-                <div class="canvas-overlay" id="canvasOverlay"></div>
+                <div class="page-section">
+                    <h3>配组参数设置</h3>
+                    <div class="form-grid">
+                        <div class="form-item">
+                            <label>批次号</label>
+                            <input type="text" id="groupingBatchId" placeholder="如: BATCH-20240101-001">
+                        </div>
+                        <div class="form-item">
+                            <label>每组电池数</label>
+                            <input type="number" id="cellsPerGroup" value="10" min="2" max="100">
+                        </div>
+                        <div class="form-item">
+                            <label>算法选择</label>
+                            <select id="groupingAlgorithm">
+                                <option value="greedy">贪心算法 (快速)</option>
+                                <option value="genetic">遗传算法 (优化)</option>
+                            </select>
+                        </div>
+                        <div class="form-item">
+                            <label>容量差异阈值 (%)</label>
+                            <input type="number" id="capacityThreshold" value="2.0" step="0.1" min="0.1" max="10.0">
+                        </div>
+                        <div class="form-item">
+                            <label>内阻差异阈值 (%)</label>
+                            <input type="number" id="resistanceThreshold" value="5.0" step="0.1" min="0.1" max="20.0">
+                        </div>
+                        <div class="form-item">
+                            <label>&nbsp;</label>
+                            <button class="btn btn-primary" onclick="CellGrouping.runGrouping()">开始配组</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="page-section" id="groupingResultSection" style="display:none;">
+                    <h3>配组结果</h3>
+                    <div class="result-summary" id="groupingSummary"></div>
+                    <div class="groups-container" id="groupsContainer"></div>
+                </div>
+
+                <div class="page-section">
+                    <h3>历史配组记录</h3>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>批次号</th>
+                                    <th>算法</th>
+                                    <th>电池总数</th>
+                                    <th>组数</th>
+                                    <th>平均一致性</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="groupingList">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
 
-            <div class="panel-info">
-                <p>提示：点击任意通道色块查看详细信息和充放电曲线</p>
+            <div class="page-content" id="page-electrolyte" style="display:none;">
+                <div class="panel-header">
+                    <h2>电解液注液量优化</h2>
+                    <div class="panel-controls">
+                        <button class="btn" onclick="ElectrolyteOptimizer.loadHistory()">刷新</button>
+                    </div>
+                </div>
+
+                <div class="page-section">
+                    <h3>注液优化计算</h3>
+                    <div class="form-grid">
+                        <div class="form-item">
+                            <label>批次号</label>
+                            <input type="text" id="electrolyteBatchId" placeholder="如: BATCH-20240101-001">
+                        </div>
+                        <div class="form-item">
+                            <label>目标产气量 (mL)</label>
+                            <input type="number" id="targetGasVolume" value="2.0" step="0.1">
+                        </div>
+                        <div class="form-item">
+                            <label>标称注液量 (g)</label>
+                            <input type="number" id="nominalVolume" value="120.0" step="0.1">
+                        </div>
+                        <div class="form-item">
+                            <label>&nbsp;</label>
+                            <button class="btn btn-primary" onclick="ElectrolyteOptimizer.optimize()">计算优化</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="page-section" id="electrolyteResultSection" style="display:none;">
+                    <h3>优化结果</h3>
+                    <div class="result-summary" id="electrolyteSummary"></div>
+                    <div class="optimization-details" id="optimizationDetails"></div>
+                </div>
+
+                <div class="page-section">
+                    <h3>历史优化记录</h3>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>批次号</th>
+                                    <th>标称注液量</th>
+                                    <th>建议注液量</th>
+                                    <th>调整量</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="electrolyteList">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="page-content" id="page-mes" style="display:none;">
+                <div class="panel-header">
+                    <h2>MES系统追溯</h2>
+                    <div class="panel-controls">
+                        <button class="btn" onclick="MESA.loadBatches()">刷新批次</button>
+                    </div>
+                </div>
+
+                <div class="page-section">
+                    <h3>批次查询</h3>
+                    <div class="form-grid">
+                        <div class="form-item">
+                            <label>批次号</label>
+                            <input type="text" id="mesBatchId" placeholder="输入批次号查询">
+                        </div>
+                        <div class="form-item">
+                            <label>开始日期</label>
+                            <input type="date" id="mesStartDate">
+                        </div>
+                        <div class="form-item">
+                            <label>结束日期</label>
+                            <input type="date" id="mesEndDate">
+                        </div>
+                        <div class="form-item">
+                            <label>&nbsp;</label>
+                            <button class="btn btn-primary" onclick="MESA.searchBatches()">查询</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="page-section" id="mesBatchDetailSection" style="display:none;">
+                    <h3>批次详情</h3>
+                    <div class="batch-detail-tabs">
+                        <button class="tab-btn active" data-tab="params" onclick="MESA.showTab('params')">工艺参数</button>
+                        <button class="tab-btn" data-tab="degraded" onclick="MESA.showTab('degraded')">降级电池</button>
+                        <button class="tab-btn" data-tab="capacity" onclick="MESA.showTab('capacity')">容量分布</button>
+                        <button class="tab-btn" data-tab="sync" onclick="MESA.showTab('sync')">同步状态</button>
+                    </div>
+                    <div class="tab-content active" id="tab-params">
+                        <div class="table-container">
+                            <table class="data-table" id="paramsTable">
+                                <thead>
+                                    <tr>
+                                        <th>时间</th>
+                                        <th>参数类型</th>
+                                        <th>参数值</th>
+                                        <th>单位</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="tab-content" id="tab-degraded" style="display:none;">
+                        <div class="table-container">
+                            <table class="data-table" id="degradedTable">
+                                <thead>
+                                    <tr>
+                                        <th>时间</th>
+                                        <th>通道</th>
+                                        <th>降级原因</th>
+                                        <th>容量比</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="tab-content" id="tab-capacity" style="display:none;">
+                        <div id="capacityDistributionChart" class="chart-container" style="height: 300px;">
+                            <canvas id="capacityChart"></canvas>
+                        </div>
+                        <div id="capacityStats" class="result-summary"></div>
+                    </div>
+                    <div class="tab-content" id="tab-sync" style="display:none;">
+                        <div class="sync-status-grid" id="syncStatus"></div>
+                        <div class="sync-actions">
+                            <button class="btn" onclick="MESA.syncParams()">同步工艺参数</button>
+                            <button class="btn" onclick="MESA.syncDegraded()">同步降级电池</button>
+                            <button class="btn" onclick="MESA.syncBatch()">同步批次信息</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="page-section">
+                    <h3>批次列表</h3>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>批次号</th>
+                                    <th>产品型号</th>
+                                    <th>电池数量</th>
+                                    <th>开始时间</th>
+                                    <th>结束时间</th>
+                                    <th>状态</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="mesBatchList">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
         </main>
     </div>
@@ -127,9 +380,22 @@
                     <div class="prediction-content" id="predictionContent"></div>
                 </div>
 
+                <div class="degradation-section" id="degradationSection">
+                    <div class="section-header">
+                        <h4>老化模式识别</h4>
+                        <button class="btn btn-sm" onclick="ChannelDetail.analyzeDegradation()">分析衰减模式</button>
+                    </div>
+                    <div class="degradation-content" id="degradationContent">
+                        <div class="degradation-placeholder" style="color: #666; text-align: center; padding: 20px;">
+                            点击"分析衰减模式"按钮进行dQ/dV分析
+                        </div>
+                    </div>
+                </div>
+
                 <div class="modal-actions">
                     <button class="btn btn-danger" id="pauseBtn" onclick="toggleChannelPause()">暂停通道</button>
                     <button class="btn" onclick="predictCapacity()">预测容量</button>
+                    <button class="btn" onclick="ChannelDetail.analyzeDegradation()">分析衰减模式</button>
                     <button class="btn" onclick="refreshChannelDetail()">刷新数据</button>
                 </div>
             </div>
@@ -138,11 +404,47 @@
 
     <script src="cabinet_panel.js"></script>
     <script src="channel_detail.js"></script>
+    <script src="grouping.js"></script>
+    <script src="electrolyte.js"></script>
+    <script src="mes.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', () => {
             window.CabinetPanel.init();
             window.ChannelDetail.init();
+            window.CellGrouping.init();
+            window.ElectrolyteOptimizer.init();
+            window.MESA.init();
         });
+
+        function switchPage(pageName) {
+            document.querySelectorAll('.nav-tab').forEach(tab => {
+                tab.classList.toggle('active', tab.dataset.page === pageName);
+            });
+
+            document.querySelectorAll('.page-content').forEach(page => {
+                page.style.display = 'none';
+            });
+
+            const targetPage = document.getElementById(`page-${pageName}`);
+            if (targetPage) {
+                targetPage.style.display = 'block';
+            }
+
+            const sidebar = document.getElementById('monitorSidebar');
+            if (pageName === 'monitor') {
+                sidebar.style.display = 'block';
+            } else {
+                sidebar.style.display = 'none';
+            }
+
+            if (pageName === 'grouping') {
+                window.CellGrouping.loadGroupingList();
+            } else if (pageName === 'electrolyte') {
+                window.ElectrolyteOptimizer.loadHistory();
+            } else if (pageName === 'mes') {
+                window.MESA.loadBatches();
+            }
+        }
 
         function refreshPanel() {
             window.CabinetPanel.refresh();

@@ -1,6 +1,8 @@
 use crate::config::ClickHouseConfig;
 use crate::models::{
-    Alert, Anomaly, CabinetStats, ChannelData, ChannelHistory, ChannelStatus, CycleFeatures,
+    Alert, Anomaly, BatteryGroup, CabinetStats, CellInfo, ChannelData, ChannelHistory,
+    ChannelStatus, CycleFeatures, DegradationAnalysis, DegradationDetail, DvDqPoint,
+    ElectrolyteInjection, GasGenerationData, GroupingResult, InjectionOptimizationResult,
     PredictionResult, Stage, StageSummary, CapacityTrend, RATED_CAPACITY,
 };
 use anyhow::{Context, Result};
@@ -440,5 +442,405 @@ impl Database {
     pub async fn execute_query(&self, query: &str) -> Result<()> {
         self.client.query(query).execute().await?;
         Ok(())
+    }
+
+    // ============================================
+    // 新增：分容配组数据库方法
+    // ============================================
+
+    pub async fn get_batch_cells(&self, batch_id: &str) -> Result<Vec<CellInfo>> {
+        let query = format!(
+            "SELECT * FROM cell_info WHERE batch_id = '{}' ORDER BY capacity_ratio DESC",
+            batch_id
+        );
+
+        let cells: Vec<CellInfo> = self.client.query(&query).fetch_all().await?;
+        Ok(cells)
+    }
+
+    pub async fn save_grouping_result(&self, result: &GroupingResult) -> Result<()> {
+        for group in &result.groups {
+            self.client
+                .insert("battery_groups")?
+                .write(group)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_grouping_result(&self, batch_id: &str) -> Result<Option<GroupingResult>> {
+        let query = format!(
+            "SELECT * FROM battery_groups WHERE batch_id = '{}' ORDER BY group_number",
+            batch_id
+        );
+
+        let groups: Vec<BatteryGroup> = self.client.query(&query).fetch_all().await?;
+
+        if groups.is_empty() {
+            return Ok(None);
+        }
+
+        let total_cells: usize = groups.iter().map(|g| g.cell_count as usize).sum();
+        let avg_consistency = if groups.is_empty() {
+            0.0
+        } else {
+            groups.iter().map(|g| g.consistency_score).sum::<f64>() / groups.len() as f64
+        };
+
+        Ok(Some(GroupingResult {
+            batch_id: batch_id.to_string(),
+            algorithm: groups[0].algorithm,
+            total_cells,
+            rejected_cells: 0,
+            group_count: groups.len(),
+            cells_per_group: groups[0].cell_count as usize,
+            groups,
+            avg_consistency_score: avg_consistency,
+            processing_time_ms: 0,
+        }))
+    }
+
+    pub async fn list_grouping_results(&self, limit: usize) -> Result<Vec<GroupingResult>> {
+        let query = format!(
+            "SELECT DISTINCT batch_id, algorithm FROM battery_groups ORDER BY date DESC LIMIT {}",
+            limit
+        );
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct BatchRow {
+            batch_id: String,
+            algorithm: crate::models::GroupingAlgorithm,
+        }
+
+        let rows: Vec<BatchRow> = self.client.query(&query).fetch_all().await?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            if let Some(result) = self.get_grouping_result(&row.batch_id).await? {
+                results.push(result);
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub async fn insert_cell_info(&self, cell: &CellInfo) -> Result<()> {
+        self.client.insert("cell_info")?.write(cell).await?.end().await?;
+        Ok(())
+    }
+
+    // ============================================
+    // 新增：电解液注液优化数据库方法
+    // ============================================
+
+    pub async fn get_batch_gas_data(&self, batch_id: &str) -> Result<Vec<GasGenerationData>> {
+        let query = format!(
+            "SELECT g.* FROM gas_generation_data g
+             INNER JOIN (
+                 SELECT cabinet_id, channel_id, MAX(timestamp) as ts
+                 FROM gas_generation_data
+                 WHERE batch_id = '{}'
+                 GROUP BY cabinet_id, channel_id
+             ) m ON g.cabinet_id = m.cabinet_id AND g.channel_id = m.channel_id AND g.timestamp = m.ts",
+            batch_id
+        );
+
+        let data: Vec<GasGenerationData> = self.client.query(&query).fetch_all().await?;
+        Ok(data)
+    }
+
+    pub async fn save_electrolyte_optimization(
+        &self,
+        result: &InjectionOptimizationResult,
+    ) -> Result<()> {
+        let injection = ElectrolyteInjection {
+            date: Utc::now().date_naive(),
+            batch_id: result.batch_id.clone(),
+            injection_id: uuid::Uuid::new_v4().to_string(),
+            cabinet_id: 0,
+            channel_id: 0,
+            cycle_index: 0,
+            nominal_volume: result.avg_nominal_volume,
+            actual_volume: result.avg_suggested_volume,
+            gas_volume: 0.0,
+            suggested_volume: result.next_batch_suggestion,
+            adjustment: result.avg_adjustment,
+            status: crate::models::InjectionStatus::Optimized,
+            confidence: 0.9,
+        };
+
+        self.client
+            .insert("electrolyte_injection")?
+            .write(&injection)
+            .await?
+            .end()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_electrolyte_optimization(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<InjectionOptimizationResult>> {
+        let query = format!(
+            "SELECT * FROM electrolyte_injection WHERE batch_id = '{}' ORDER BY date DESC LIMIT 1",
+            batch_id
+        );
+
+        let result: Option<ElectrolyteInjection> = match self.client.query(&query).fetch_one().await {
+            Ok(Some(r)) => r,
+            _ => return Ok(None),
+        };
+
+        Ok(Some(InjectionOptimizationResult {
+            batch_id: result.batch_id.clone(),
+            total_channels: 0,
+            avg_nominal_volume: result.nominal_volume,
+            avg_suggested_volume: result.suggested_volume,
+            avg_adjustment: result.adjustment,
+            over_injected_count: 0,
+            under_injected_count: 0,
+            estimated_gas_reduction: 0.0,
+            estimated_capacity_improvement: 0.0,
+            next_batch_suggestion: result.suggested_volume,
+        }))
+    }
+
+    pub async fn insert_gas_data(&self, data: &GasGenerationData) -> Result<()> {
+        self.client
+            .insert("gas_generation_data")?
+            .write(data)
+            .await?
+            .end()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_electrolyte_injection(&self, injection: &ElectrolyteInjection) -> Result<()> {
+        self.client
+            .insert("electrolyte_injection")?
+            .write(injection)
+            .await?
+            .end()
+            .await?;
+        Ok(())
+    }
+
+    // ============================================
+    // 新增：老化模式识别数据库方法
+    // ============================================
+
+    pub async fn save_degradation_analysis(&self, analysis: &DegradationAnalysis) -> Result<()> {
+        self.client
+            .insert("degradation_analysis")?
+            .write(analysis)
+            .await?
+            .end()
+            .await?;
+
+        #[derive(clickhouse::Row, serde::Serialize)]
+        struct DvDqRow {
+            timestamp: DateTime<Utc>,
+            cabinet_id: u16,
+            channel_id: u32,
+            cycle_index: u16,
+            voltage: Vec<f64>,
+            dq_dv: Vec<f64>,
+            capacity: Vec<f64>,
+            peak_positions: Vec<f64>,
+            peak_heights: Vec<f64>,
+        }
+
+        let row = DvDqRow {
+            timestamp: analysis.timestamp,
+            cabinet_id: analysis.cabinet_id,
+            channel_id: analysis.channel_id,
+            cycle_index: analysis.cycle_index,
+            voltage: Vec::new(),
+            dq_dv: Vec::new(),
+            capacity: Vec::new(),
+            peak_positions: analysis.peak_positions.clone(),
+            peak_heights: analysis.peak_heights.clone(),
+        };
+
+        self.client
+            .insert("dvdq_analysis")?
+            .write(&row)
+            .await?
+            .end()
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_degradation_analysis(
+        &self,
+        cabinet_id: u16,
+        channel_id: u32,
+        limit: usize,
+    ) -> Result<Option<DegradationDetail>> {
+        let query = format!(
+            "SELECT * FROM degradation_analysis \
+             WHERE cabinet_id = {} AND channel_id = {} \
+             ORDER BY cycle_index DESC LIMIT {}",
+            cabinet_id, channel_id, limit
+        );
+
+        let analyses: Vec<DegradationAnalysis> = self.client.query(&query).fetch_all().await?;
+
+        if analyses.is_empty() {
+            return Ok(None);
+        }
+
+        let latest = analyses.into_iter().next().unwrap();
+
+        let dvdq_query = format!(
+            "SELECT voltage, dq_dv, capacity, peak_positions, peak_heights \
+             FROM dvdq_analysis \
+             WHERE cabinet_id = {} AND channel_id = {} \
+             ORDER BY timestamp DESC LIMIT 1",
+            cabinet_id, channel_id
+        );
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct DvDqRow {
+            voltage: Vec<f64>,
+            dq_dv: Vec<f64>,
+            capacity: Vec<f64>,
+            peak_positions: Vec<f64>,
+            peak_heights: Vec<f64>,
+        }
+
+        let dvdq_row: Option<DvDqRow> = self.client.query(&dvdq_query).fetch_one().await?;
+
+        let mut dvdq_curve = Vec::new();
+        if let Some(row) = dvdq_row {
+            for i in 0..row.voltage.len() {
+                dvdq_curve.push(DvDqPoint {
+                    voltage: row.voltage[i],
+                    dq_dv: row.dq_dv[i],
+                    capacity: row.capacity[i],
+                });
+            }
+        }
+
+        let historical_query = format!(
+            "SELECT cycle_index, mode, confidence \
+             FROM degradation_analysis \
+             WHERE cabinet_id = {} AND channel_id = {} \
+             ORDER BY cycle_index DESC LIMIT 20",
+            cabinet_id, channel_id
+        );
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct HistoryRow {
+            cycle_index: u16,
+            mode: crate::models::DegradationMode,
+            confidence: f64,
+        }
+
+        let history_rows: Vec<HistoryRow> = self.client.query(&historical_query).fetch_all().await?;
+
+        let historical_modes: Vec<(u16, crate::models::DegradationMode, f64)> = history_rows
+            .into_iter()
+            .map(|r| (r.cycle_index, r.mode, r.confidence))
+            .collect();
+
+        Ok(Some(DegradationDetail {
+            analysis: latest,
+            dvdq_curve,
+            historical_modes,
+        }))
+    }
+
+    // ============================================
+    // 新增：MES系统对接数据库方法
+    // ============================================
+
+    pub async fn get_batch_detail(&self, batch_id: &str) -> Result<Option<serde_json::Value>> {
+        let param_query = format!(
+            "SELECT * FROM process_params WHERE batch_id = '{}' ORDER BY timestamp DESC LIMIT 100",
+            batch_id
+        );
+
+        let params: Vec<crate::models::ProcessParamRecord> =
+            self.client.query(&param_query).fetch_all().await?;
+
+        let degraded_query = format!(
+            "SELECT * FROM degraded_cells WHERE batch_id = '{}' ORDER BY timestamp DESC LIMIT 100",
+            batch_id
+        );
+
+        let degraded: Vec<crate::models::DegradedCellRecord> =
+            self.client.query(&degraded_query).fetch_all().await?;
+
+        let batch_query = format!(
+            "SELECT * FROM batch_info WHERE batch_id = '{}' ORDER BY date DESC LIMIT 1",
+            batch_id
+        );
+
+        let batch_info: Option<crate::models::BatchInfo> = self.client.query(&batch_query).fetch_one().await?;
+
+        Ok(Some(serde_json::json!({
+            "process_params": params,
+            "degraded_cells": degraded,
+            "batch_info": batch_info,
+        })))
+    }
+
+    pub async fn get_batch_capacities(&self, batch_id: &str) -> Result<Vec<f64>> {
+        let query = format!(
+            "SELECT measured_capacity FROM cell_info WHERE batch_id = '{}'",
+            batch_id
+        );
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct CapRow {
+            measured_capacity: f64,
+        }
+
+        let rows: Vec<CapRow> = self.client.query(&query).fetch_all().await?;
+        Ok(rows.into_iter().map(|r| r.measured_capacity).collect())
+    }
+
+    pub async fn insert_process_param(&self, param: &crate::models::ProcessParamRecord) -> Result<()> {
+        self.client
+            .insert("process_params")?
+            .write(param)
+            .await?
+            .end()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_degraded_cell(&self, cell: &crate::models::DegradedCellRecord) -> Result<()> {
+        self.client
+            .insert("degraded_cells")?
+            .write(cell)
+            .await?
+            .end()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_batch_info(&self, batch: &crate::models::BatchInfo) -> Result<()> {
+        self.client
+            .insert("batch_info")?
+            .write(batch)
+            .await?
+            .end()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_batch_info(&self, batch_id: &str) -> Result<Option<crate::models::BatchInfo>> {
+        let query = format!(
+            "SELECT * FROM batch_info WHERE batch_id = '{}' ORDER BY date DESC LIMIT 1",
+            batch_id
+        );
+
+        let result: Option<crate::models::BatchInfo> = self.client.query(&query).fetch_one().await?;
+        Ok(result)
     }
 }

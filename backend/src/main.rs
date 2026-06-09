@@ -2,9 +2,13 @@ mod alarm_sender;
 mod anomaly_detector;
 mod api;
 mod capacity_predictor;
+mod cell_grouping;
 mod config;
 mod data_pipeline;
 mod database;
+mod degradation_analyzer;
+mod electrolyte_optimizer;
+mod mes_integrator;
 mod messages;
 mod metrics;
 mod models;
@@ -15,9 +19,13 @@ use crate::alarm_sender::AlarmSender;
 use crate::anomaly_detector::AnomalyDetector;
 use crate::api::{create_router, ApiState};
 use crate::capacity_predictor::CapacityPredictor;
+use crate::cell_grouping::CellGroupingService;
 use crate::config::Config;
 use crate::data_pipeline::DataPipeline;
 use crate::database::Database;
+use crate::degradation_analyzer::DegradationAnalysisService;
+use crate::electrolyte_optimizer::ElectrolyteOptimizationService;
+use crate::mes_integrator::MesIntegrationService;
 use crate::messages::{
     AlertSender, AnomalyReceiver, AnomalySender, PauseReceiver, PauseSender, PredictionReceiver,
     PredictionSender, PredictionResultReceiver, PredictionResultSender,
@@ -160,6 +168,26 @@ async fn main() -> Result<()> {
     .with_rated_capacity(rated_capacity);
     info!("Alarm sender initialized");
 
+    let grouping_service = Arc::new(std::sync::Mutex::new(
+        CellGroupingService::default()
+    ));
+    info!("Cell grouping service initialized");
+
+    let electrolyte_service = Arc::new(std::sync::Mutex::new(
+        ElectrolyteOptimizationService::default()
+    ));
+    info!("Electrolyte optimization service initialized");
+
+    let degradation_service = Arc::new(std::sync::Mutex::new(
+        DegradationAnalysisService::default()
+    ));
+    info!("Degradation analysis service initialized");
+
+    let mes_service = Arc::new(std::sync::Mutex::new(
+        MesIntegrationService::new(db.clone())
+    ));
+    info!("MES integration service initialized");
+
     mqtt_collector.start().await?;
     info!("MQTT collector started");
 
@@ -196,6 +224,10 @@ async fn main() -> Result<()> {
         predictor: capacity_predictor,
         alert_manager: alarm_sender,
         prometheus_handle: Arc::new(prometheus_handle),
+        grouping_service: grouping_service.clone(),
+        electrolyte_service: electrolyte_service.clone(),
+        degradation_service: degradation_service.clone(),
+        mes_service: mes_service.clone(),
     });
 
     let cors = CorsLayer::new()
@@ -216,7 +248,7 @@ async fn main() -> Result<()> {
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     info!("Starting HTTP server on {}", addr);
-    info!("System architecture:");
+    info!("System architecture (v1.1.0 - Extended):");
     info!("  ┌─────────────────┐      ┌─────────────────┐      ┌──────────────────┐");
     info!("  │  MQTT Collector │─────▶│  Data Pipeline  │─────▶│ Anomaly Detector │");
     info!("  └─────────────────┘      └─────────────────┘      └────────┬─────────┘");
@@ -225,6 +257,12 @@ async fn main() -> Result<()> {
     info!("                    ┌──────────────────────┐      ┌───────────────────┐");
     info!("                    │ Capacity Predictor   │      │   Alarm Sender    │");
     info!("                    └──────────────────────┘      └───────────────────┘");
+    info!("");
+    info!("  New Features (v1.1.0):");
+    info!("  ┌───────────────────┐  ┌────────────────────┐  ┌────────────────────┐  ┌────────────┐");
+    info!("  │  Cell Grouping    │  │ Electrolyte Opt    │  │ Degradation Analy  │  │  MES Sync  │");
+    info!("  │ (GA + Greedy)     │  │ (Feedback Control) │  │ (dQ/dV Analysis)   │  │ (MES/ERP)  │");
+    info!("  └───────────────────┘  └────────────────────┘  └────────────────────┘  └────────────┘");
     info!("");
     info!("Prometheus metrics available at /metrics endpoint");
 
