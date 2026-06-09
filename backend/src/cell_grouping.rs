@@ -21,6 +21,10 @@ pub struct GeneticParams {
     pub mutation_rate: f64,
     pub crossover_rate: f64,
     pub elite_count: usize,
+    pub time_limit_ms: u64,
+    pub enable_parallel: bool,
+    pub large_dataset_threshold: usize,
+    pub fallback_to_greedy_on_timeout: bool,
 }
 
 impl Default for GeneticParams {
@@ -31,6 +35,10 @@ impl Default for GeneticParams {
             mutation_rate: 0.1,
             crossover_rate: 0.8,
             elite_count: 5,
+            time_limit_ms: 30000,
+            enable_parallel: true,
+            large_dataset_threshold: 1000,
+            fallback_to_greedy_on_timeout: true,
         }
     }
 }
@@ -158,6 +166,12 @@ impl CellGroupingService {
         }
 
         let params = &self.config.genetic_params;
+        let start_time = std::time::Instant::now();
+
+        if cells.len() >= params.large_dataset_threshold {
+            return self.genetic_grouping_divide_conquer(cells, batch_id, num_groups);
+        }
+
         let mut rng = rand::thread_rng();
 
         let mut population: Vec<Vec<usize>> = (0..params.population_size)
@@ -172,9 +186,158 @@ impl CellGroupingService {
             .collect();
 
         let mut best_fitness = f64::NEG_INFINITY;
-        let mut best_individual = None;
+        let mut best_individual: Option<Vec<usize>> = None;
+        let mut timed_out = false;
 
         for _generation in 0..params.max_generations {
+            if start_time.elapsed().as_millis() as u64 >= params.time_limit_ms {
+                timed_out = true;
+                break;
+            }
+
+            let fitnesses: Vec<f64> = population
+                .iter()
+                .map(|ind| self.fitness_function(ind, &cells, num_groups))
+                .collect();
+
+            for (i, &fitness) in fitnesses.iter().enumerate() {
+                if fitness > best_fitness {
+                    best_fitness = fitness;
+                    best_individual = Some(population[i].clone());
+                }
+            }
+
+            let mut new_population = Vec::new();
+
+            let mut elite_indices: Vec<usize> = (0..population.len()).collect();
+            elite_indices.sort_by(|&a, &b| fitnesses[b].partial_cmp(&fitnesses[a]).unwrap());
+            for &idx in elite_indices.iter().take(params.elite_count) {
+                new_population.push(population[idx].clone());
+            }
+
+            while new_population.len() < params.population_size {
+                let parent1 = self.tournament_selection(&population, &fitnesses, 3, &mut rng);
+                let parent2 = self.tournament_selection(&population, &fitnesses, 3, &mut rng);
+
+                let child = if rng.gen::<f64>() < params.crossover_rate {
+                    self.order_crossover(&population[parent1], &population[parent2], &mut rng)
+                } else {
+                    population[parent1].clone()
+                };
+
+                let child = if rng.gen::<f64>() < params.mutation_rate {
+                    self.swap_mutation(&child, &mut rng)
+                } else {
+                    child
+                };
+
+                new_population.push(child);
+            }
+
+            population = new_population;
+        }
+
+        if timed_out && best_individual.is_none() && params.fallback_to_greedy_on_timeout {
+            return self.greedy_grouping(cells, batch_id);
+        }
+
+        match best_individual {
+            Some(ind) => self.decode_individual(&ind, &cells, batch_id, num_groups),
+            None => self.greedy_grouping(cells, batch_id),
+        }
+    }
+
+    fn genetic_grouping_divide_conquer(
+        &self,
+        mut cells: Vec<CellInfo>,
+        batch_id: &str,
+        num_groups: usize,
+    ) -> Vec<BatteryGroup> {
+        let params = &self.config.genetic_params;
+        let start_time = std::time::Instant::now();
+
+        cells.sort_by(|a, b| a.measured_capacity.partial_cmp(&b.measured_capacity).unwrap());
+
+        let chunk_size = (cells.len() / 4).max(params.large_dataset_threshold);
+        let mut all_groups = Vec::new();
+        let mut chunk_offset = 0;
+
+        for (chunk_idx, chunk) in cells.chunks(chunk_size).enumerate() {
+            if start_time.elapsed().as_millis() as u64 >= params.time_limit_ms {
+                let remaining: Vec<CellInfo> = cells.chunks(chunk_size).skip(chunk_idx)
+                    .flatten().cloned().collect();
+                let greedy_groups = self.greedy_grouping_with_offset(
+                    remaining, batch_id, all_groups.len() as u32, chunk_offset
+                );
+                all_groups.extend(greedy_groups);
+                break;
+            }
+
+            let chunk_cells: Vec<CellInfo> = chunk.to_vec();
+            let chunk_num_groups = chunk_cells.len() / self.config.cells_per_group;
+            
+            if chunk_num_groups > 0 {
+                let sub_params = GeneticParams {
+                    population_size: params.population_size / 2,
+                    max_generations: params.max_generations / 2,
+                    time_limit_ms: params.time_limit_ms / 4,
+                    ..params.clone()
+                };
+                
+                let sub_config = GroupingConfig {
+                    genetic_params: sub_params,
+                    ..self.config.clone()
+                };
+                
+                let sub_service = CellGroupingService::new(sub_config);
+                let sub_groups = sub_service.genetic_grouping_standard(
+                    chunk_cells, batch_id, all_groups.len() as u32, chunk_offset
+                );
+                
+                let grouped_count = sub_groups.len() * self.config.cells_per_group;
+                chunk_offset += grouped_count;
+                all_groups.extend(sub_groups);
+            }
+        }
+
+        all_groups
+    }
+
+    fn genetic_grouping_standard(
+        &self,
+        cells: Vec<CellInfo>,
+        batch_id: &str,
+        group_number_offset: u32,
+        cell_id_offset: usize,
+    ) -> Vec<BatteryGroup> {
+        let num_groups = cells.len() / self.config.cells_per_group;
+        if num_groups == 0 {
+            return Vec::new();
+        }
+
+        let params = &self.config.genetic_params;
+        let start_time = std::time::Instant::now();
+        let mut rng = rand::thread_rng();
+
+        let mut population: Vec<Vec<usize>> = (0..params.population_size)
+            .map(|_| {
+                let mut permutation: Vec<usize> = (0..cells.len()).collect();
+                for i in (1..permutation.len()).rev() {
+                    let j = rng.gen_range(0..=i);
+                    permutation.swap(i, j);
+                }
+                permutation
+            })
+            .collect();
+
+        let mut best_fitness = f64::NEG_INFINITY;
+        let mut best_individual: Option<Vec<usize>> = None;
+
+        for _generation in 0..params.max_generations {
+            if start_time.elapsed().as_millis() as u64 >= params.time_limit_ms {
+                break;
+            }
+
             let fitnesses: Vec<f64> = population
                 .iter()
                 .map(|ind| self.fitness_function(ind, &cells, num_groups))
@@ -218,9 +381,100 @@ impl CellGroupingService {
         }
 
         match best_individual {
-            Some(ind) => self.decode_individual(&ind, &cells, batch_id, num_groups),
-            None => self.greedy_grouping(cells, batch_id),
+            Some(ind) => self.decode_individual_with_offset(
+                &ind, &cells, batch_id, num_groups, group_number_offset, cell_id_offset
+            ),
+            None => self.greedy_grouping_with_offset(cells, batch_id, group_number_offset, cell_id_offset),
         }
+    }
+
+    fn greedy_grouping_with_offset(
+        &self,
+        mut cells: Vec<CellInfo>,
+        batch_id: &str,
+        group_number_offset: u32,
+        _cell_id_offset: usize,
+    ) -> Vec<BatteryGroup> {
+        cells.sort_by(|a, b| b.capacity_ratio.partial_cmp(&a.capacity_ratio).unwrap());
+
+        let mut groups = Vec::new();
+        let mut group_number = group_number_offset;
+
+        while cells.len() >= self.config.cells_per_group {
+            group_number += 1;
+            let seed = cells.remove(0);
+            let mut group_cells = vec![seed.clone()];
+
+            let mut i = 0;
+            while group_cells.len() < self.config.cells_per_group && i < cells.len() {
+                let candidate = &cells[i];
+
+                let group_caps: Vec<f64> = group_cells.iter().map(|c| c.measured_capacity).collect();
+                let group_res: Vec<f64> = group_cells.iter().map(|c| c.internal_resistance).collect();
+
+                let max_cap = group_caps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let min_cap = group_caps.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max_res = group_res.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let min_res = group_res.iter().cloned().fold(f64::INFINITY, f64::min);
+
+                let cap_diff_ok = (candidate.measured_capacity - max_cap).abs() < self.config.max_capacity_diff
+                    && (candidate.measured_capacity - min_cap).abs() < self.config.max_capacity_diff;
+                let res_diff_ok = (candidate.internal_resistance - max_res).abs() < self.config.max_resistance_diff
+                    && (candidate.internal_resistance - min_res).abs() < self.config.max_resistance_diff;
+
+                if cap_diff_ok && res_diff_ok {
+                    group_cells.push(cells.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+
+            if group_cells.len() == self.config.cells_per_group {
+                groups.push(self.create_battery_group(group_cells, batch_id, group_number));
+            } else {
+                cells.extend(group_cells.into_iter().skip(1));
+            }
+        }
+
+        groups
+    }
+
+    fn decode_individual_with_offset(
+        &self,
+        individual: &[usize],
+        cells: &[CellInfo],
+        batch_id: &str,
+        num_groups: usize,
+        group_number_offset: u32,
+        _cell_id_offset: usize,
+    ) -> Vec<BatteryGroup> {
+        let mut groups = Vec::new();
+
+        for group_idx in 0..num_groups {
+            let start = group_idx * self.config.cells_per_group;
+            let end = start + self.config.cells_per_group;
+
+            let group_cells: Vec<CellInfo> = (start..end)
+                .map(|i| cells[individual[i]].clone())
+                .collect();
+
+            groups.push(self.create_battery_group(
+                group_cells,
+                batch_id,
+                group_number_offset + group_idx as u32 + 1,
+            ));
+        }
+
+        groups
+    }
+
+    fn calculate_std(values: &[f64]) -> f64 {
+        if values.len() < 2 {
+            return 0.0;
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        variance.sqrt()
     }
 
     fn fitness_function(&self, individual: &[usize], cells: &[CellInfo], num_groups: usize) -> f64 {

@@ -7,12 +7,18 @@ pub struct ElectrolyteConfig {
     pub nominal_injection_volume: f64,
     pub min_injection_volume: f64,
     pub max_injection_volume: f64,
+    pub hard_min_injection_volume: f64,
+    pub hard_max_injection_volume: f64,
     pub target_gas_volume: f64,
     pub max_gas_volume: f64,
     pub min_gas_volume: f64,
     pub gas_to_electrolyte_ratio: f64,
     pub learning_rate: f64,
     pub history_window_size: usize,
+    pub min_pressure_data_coverage: f64,
+    pub manual_confirmation_confidence_threshold: f64,
+    pub max_adjustment_per_batch: f64,
+    pub enable_fallback_to_nominal: bool,
 }
 
 impl Default for ElectrolyteConfig {
@@ -21,12 +27,18 @@ impl Default for ElectrolyteConfig {
             nominal_injection_volume: 120.0,
             min_injection_volume: 100.0,
             max_injection_volume: 140.0,
+            hard_min_injection_volume: 90.0,
+            hard_max_injection_volume: 150.0,
             target_gas_volume: 50.0,
             max_gas_volume: 80.0,
             min_gas_volume: 20.0,
             gas_to_electrolyte_ratio: 0.8,
             learning_rate: 0.3,
             history_window_size: 100,
+            min_pressure_data_coverage: 0.7,
+            manual_confirmation_confidence_threshold: 0.6,
+            max_adjustment_per_batch: 10.0,
+            enable_fallback_to_nominal: true,
         }
     }
 }
@@ -49,27 +61,79 @@ impl ElectrolyteOptimizationService {
             return None;
         }
 
-        if gas_data.cumulative_gas < self.config.min_gas_volume * 0.5 {
+        let pressure_available = self.check_pressure_data_availability(gas_data);
+        let data_completeness = self.assess_data_completeness(gas_data);
+        let mut used_fallback = false;
+        let mut hard_limit_applied = false;
+
+        let effective_gas_volume = if pressure_available && data_completeness >= self.config.min_pressure_data_coverage {
+            gas_data.cumulative_gas
+        } else {
+            used_fallback = true;
+            if self.config.enable_fallback_to_nominal {
+                self.get_historical_avg_gas()
+            } else {
+                return None;
+            }
+        };
+
+        if effective_gas_volume < self.config.min_gas_volume * 0.5 {
             return None;
         }
 
-        self.history_data.push((self.config.nominal_injection_volume, gas_data.cumulative_gas));
-        if self.history_data.len() > self.config.history_window_size {
-            self.history_data.remove(0);
+        if !used_fallback {
+            self.history_data.push((self.config.nominal_injection_volume, gas_data.cumulative_gas));
+            if self.history_data.len() > self.config.history_window_size {
+                self.history_data.remove(0);
+            }
         }
 
-        let suggested_volume = self.calculate_suggested_volume(gas_data.cumulative_gas);
+        let mut suggested_volume = self.calculate_suggested_volume(effective_gas_volume);
         let adjustment = suggested_volume - self.config.nominal_injection_volume;
 
-        let status = if gas_data.cumulative_gas > self.config.max_gas_volume {
+        if adjustment.abs() > self.config.max_adjustment_per_batch {
+            suggested_volume = self.config.nominal_injection_volume 
+                + adjustment.signum() * self.config.max_adjustment_per_batch;
+            hard_limit_applied = true;
+        }
+
+        if suggested_volume < self.config.hard_min_injection_volume {
+            suggested_volume = self.config.hard_min_injection_volume;
+            hard_limit_applied = true;
+        }
+        if suggested_volume > self.config.hard_max_injection_volume {
+            suggested_volume = self.config.hard_max_injection_volume;
+            hard_limit_applied = true;
+        }
+
+        if suggested_volume < self.config.min_injection_volume {
+            suggested_volume = self.config.min_injection_volume;
+            hard_limit_applied = true;
+        }
+        if suggested_volume > self.config.max_injection_volume {
+            suggested_volume = self.config.max_injection_volume;
+            hard_limit_applied = true;
+        }
+
+        let status = if effective_gas_volume > self.config.max_gas_volume {
             InjectionStatus::OverInjected
-        } else if gas_data.cumulative_gas < self.config.min_gas_volume {
+        } else if effective_gas_volume < self.config.min_gas_volume {
             InjectionStatus::UnderInjected
         } else {
             InjectionStatus::Normal
         };
 
-        let confidence = self.calculate_confidence(gas_data.cumulative_gas);
+        let mut confidence = self.calculate_confidence(effective_gas_volume);
+        if used_fallback {
+            confidence *= 0.5;
+        }
+        if data_completeness < self.config.min_pressure_data_coverage {
+            confidence *= data_completeness;
+        }
+
+        let requires_manual_confirmation = confidence < self.config.manual_confirmation_confidence_threshold
+            || used_fallback
+            || hard_limit_applied;
 
         let injection_id = Uuid::new_v4().to_string();
         let batch_id = format!("BATCH_{}", Utc::now().format("%Y%m%d"));
@@ -83,12 +147,81 @@ impl ElectrolyteOptimizationService {
             cycle_index: gas_data.cycle_index,
             nominal_volume: self.config.nominal_injection_volume,
             actual_volume: self.config.nominal_injection_volume,
-            gas_volume: gas_data.cumulative_gas,
+            gas_volume: effective_gas_volume,
             suggested_volume,
-            adjustment,
+            adjustment: suggested_volume - self.config.nominal_injection_volume,
             status,
             confidence,
+            requires_manual_confirmation,
+            used_fallback,
+            data_completeness,
+            hard_limit_applied,
+            pressure_data_available: pressure_available,
+            confirmation_notes: None,
+            confirmed_by: None,
+            confirmed_at: None,
         })
+    }
+
+    fn check_pressure_data_availability(&self, gas_data: &GasGenerationData) -> bool {
+        if gas_data.pressure <= 0.0 || gas_data.pressure > 200.0 {
+            return false;
+        }
+        if gas_data.temperature <= -50.0 || gas_data.temperature > 150.0 {
+            return false;
+        }
+        if gas_data.cumulative_gas < 0.0 || gas_data.gas_generation_rate < 0.0 {
+            return false;
+        }
+        true
+    }
+
+    fn assess_data_completeness(&self, gas_data: &GasGenerationData) -> f64 {
+        let mut score = 1.0;
+        
+        if gas_data.pressure <= 0.0 {
+            score -= 0.4;
+        }
+        if gas_data.temperature <= -50.0 {
+            score -= 0.2;
+        }
+        if gas_data.cumulative_gas <= 0.0 {
+            score -= 0.3;
+        }
+        if gas_data.gas_generation_rate <= 0.0 {
+            score -= 0.1;
+        }
+        
+        if self.history_data.len() < 10 {
+            score *= 0.8;
+        }
+        
+        score.max(0.0).min(1.0)
+    }
+
+    fn get_historical_avg_gas(&self) -> f64 {
+        if self.history_data.is_empty() {
+            return self.config.target_gas_volume;
+        }
+        let sum: f64 = self.history_data.iter().map(|(_, gas)| *gas).sum();
+        sum / self.history_data.len() as f64
+    }
+
+    pub fn confirm_injection(
+        &mut self,
+        injection_id: &str,
+        confirmed_volume: f64,
+        notes: Option<String>,
+        operator: String,
+    ) -> Option<ElectrolyteInjection> {
+        None
+    }
+
+    pub fn get_channels_requiring_confirmation(
+        &self,
+        batch_id: &str,
+    ) -> Vec<&ElectrolyteInjection> {
+        Vec::new()
     }
 
     pub fn optimize_batch(&self, batch_gas_data: &[GasGenerationData], batch_id: String) -> InjectionOptimizationResult {
@@ -104,28 +237,81 @@ impl ElectrolyteOptimizationService {
                 estimated_gas_reduction: 0.0,
                 estimated_capacity_improvement: 0.0,
                 next_batch_suggestion: self.config.nominal_injection_volume,
+                channels_with_missing_data: 0,
+                channels_requiring_confirmation: 0,
+                used_fallback_strategy: false,
+                avg_data_completeness: 1.0,
+                hard_limits_applied_count: 0,
+                fallback_explanation: String::new(),
             };
         }
 
         let total_channels = batch_gas_data.len();
-        let avg_gas_volume: f64 = batch_gas_data.iter().map(|g| g.cumulative_gas).sum::<f64>() / total_channels as f64;
-
+        let mut valid_gas_values: Vec<f64> = Vec::new();
         let mut over_injected_count = 0;
         let mut under_injected_count = 0;
         let mut suggestions: Vec<f64> = Vec::new();
+        let mut channels_with_missing_data = 0;
+        let mut channels_requiring_confirmation = 0;
+        let mut hard_limits_applied_count = 0;
+        let mut completeness_scores: Vec<f64> = Vec::new();
 
         for gas_data in batch_gas_data {
-            let suggested = self.calculate_suggested_volume(gas_data.cumulative_gas);
+            let pressure_ok = self.check_pressure_data_availability(gas_data);
+            let completeness = self.assess_data_completeness(gas_data);
+            completeness_scores.push(completeness);
+
+            if !pressure_ok || completeness < self.config.min_pressure_data_coverage {
+                channels_with_missing_data += 1;
+                channels_requiring_confirmation += 1;
+            }
+
+            let effective_gas = if pressure_ok && completeness >= self.config.min_pressure_data_coverage {
+                gas_data.cumulative_gas
+            } else {
+                self.get_historical_avg_gas()
+            };
+
+            valid_gas_values.push(effective_gas);
+
+            let mut suggested = self.calculate_suggested_volume(effective_gas);
+            let adjustment = suggested - self.config.nominal_injection_volume;
+
+            if adjustment.abs() > self.config.max_adjustment_per_batch {
+                suggested = self.config.nominal_injection_volume 
+                    + adjustment.signum() * self.config.max_adjustment_per_batch;
+                hard_limits_applied_count += 1;
+            }
+            if suggested < self.config.hard_min_injection_volume {
+                suggested = self.config.hard_min_injection_volume;
+                hard_limits_applied_count += 1;
+            }
+            if suggested > self.config.hard_max_injection_volume {
+                suggested = self.config.hard_max_injection_volume;
+                hard_limits_applied_count += 1;
+            }
+
             suggestions.push(suggested);
 
-            if gas_data.cumulative_gas > self.config.max_gas_volume {
+            if effective_gas > self.config.max_gas_volume {
                 over_injected_count += 1;
-            } else if gas_data.cumulative_gas < self.config.min_gas_volume {
+            } else if effective_gas < self.config.min_gas_volume {
                 under_injected_count += 1;
             }
         }
 
-        let avg_suggested_volume = suggestions.iter().sum::<f64>() / suggestions.len() as f64;
+        let avg_gas_volume = if valid_gas_values.is_empty() {
+            self.config.target_gas_volume
+        } else {
+            valid_gas_values.iter().sum::<f64>() / valid_gas_values.len() as f64
+        };
+
+        let avg_suggested_volume = if suggestions.is_empty() {
+            self.config.nominal_injection_volume
+        } else {
+            suggestions.iter().sum::<f64>() / suggestions.len() as f64
+        };
+
         let avg_adjustment = avg_suggested_volume - self.config.nominal_injection_volume;
 
         let next_batch_suggestion = self.calculate_next_batch_suggestion(avg_gas_volume);
@@ -143,6 +329,33 @@ impl ElectrolyteOptimizationService {
             0.0
         };
 
+        let avg_data_completeness = if completeness_scores.is_empty() {
+            1.0
+        } else {
+            completeness_scores.iter().sum::<f64>() / completeness_scores.len() as f64
+        };
+
+        let used_fallback_strategy = channels_with_missing_data > 0;
+        let mut fallback_explanation = String::new();
+        if used_fallback_strategy {
+            fallback_explanation = format!(
+                "{}个通道压力数据不足（覆盖率{:.1}%，阈值{:.0}%），已使用历史平均值作为fallback",
+                channels_with_missing_data,
+                avg_data_completeness * 100.0,
+                self.config.min_pressure_data_coverage * 100.0
+            );
+        }
+
+        if hard_limits_applied_count > 0 {
+            if !fallback_explanation.is_empty() {
+                fallback_explanation.push_str("；");
+            }
+            fallback_explanation.push_str(&format!(
+                "{}个通道的注液量建议被安全限值约束",
+                hard_limits_applied_count
+            ));
+        }
+
         InjectionOptimizationResult {
             batch_id,
             total_channels,
@@ -154,6 +367,12 @@ impl ElectrolyteOptimizationService {
             estimated_gas_reduction,
             estimated_capacity_improvement,
             next_batch_suggestion,
+            channels_with_missing_data,
+            channels_requiring_confirmation,
+            used_fallback_strategy,
+            avg_data_completeness,
+            hard_limits_applied_count,
+            fallback_explanation,
         }
     }
 

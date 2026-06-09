@@ -352,6 +352,14 @@ pub struct ElectrolyteInjection {
     pub adjustment: f64,
     pub status: InjectionStatus,
     pub confidence: f64,
+    pub requires_manual_confirmation: bool,
+    pub used_fallback: bool,
+    pub data_completeness: f64,
+    pub hard_limit_applied: bool,
+    pub pressure_data_available: bool,
+    pub confirmation_notes: Option<String>,
+    pub confirmed_by: Option<String>,
+    pub confirmed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +374,12 @@ pub struct InjectionOptimizationResult {
     pub estimated_gas_reduction: f64,
     pub estimated_capacity_improvement: f64,
     pub next_batch_suggestion: f64,
+    pub channels_with_missing_data: usize,
+    pub channels_requiring_confirmation: usize,
+    pub used_fallback_strategy: bool,
+    pub avg_data_completeness: f64,
+    pub hard_limits_applied_count: usize,
+    pub fallback_explanation: String,
 }
 
 // ============================================
@@ -431,6 +445,17 @@ pub struct DegradationAnalysis {
     pub capacity_fade_rate: f64,
     pub resistance_growth_rate: f64,
     pub recommendations: String,
+    pub battery_model: Option<String>,
+    pub used_transfer_learning: bool,
+    pub transfer_source_model: Option<String>,
+    pub transfer_similarity: Option<f64>,
+    pub baseline_sample_count: usize,
+    pub requires_manual_confirmation: bool,
+    pub is_new_model: bool,
+    pub manually_corrected_mode: Option<DegradationMode>,
+    pub correction_notes: Option<String>,
+    pub corrected_by: Option<String>,
+    pub corrected_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

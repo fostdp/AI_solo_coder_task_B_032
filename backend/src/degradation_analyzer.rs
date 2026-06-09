@@ -11,6 +11,12 @@ pub struct DegradationConfig {
     pub sei_peak_range: (f64, f64),
     pub fading_rate_threshold: f64,
     pub resistance_growth_threshold: f64,
+    pub enable_transfer_learning: bool,
+    pub min_baseline_samples: usize,
+    pub new_model_confidence_penalty: f64,
+    pub transfer_learning_weight: f64,
+    pub require_manual_confirmation_threshold: f64,
+    pub max_transfer_distance: f64,
 }
 
 impl Default for DegradationConfig {
@@ -24,14 +30,46 @@ impl Default for DegradationConfig {
             sei_peak_range: (0.5, 1.5),
             fading_rate_threshold: 0.02,
             resistance_growth_threshold: 0.05,
+            enable_transfer_learning: true,
+            min_baseline_samples: 5,
+            new_model_confidence_penalty: 0.3,
+            transfer_learning_weight: 0.7,
+            require_manual_confirmation_threshold: 0.6,
+            max_transfer_distance: 0.3,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelBaseline {
+    pub model_name: String,
+    pub avg_dvdq_curve: Vec<DvDqPoint>,
+    pub peak_positions: Vec<f64>,
+    pub sample_count: usize,
+    pub cathode_peak_range: (f64, f64),
+    pub anode_peak_range: (f64, f64),
+    pub sei_peak_range: (f64, f64),
+    pub model_features: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManualLabel {
+    pub cabinet_id: u16,
+    pub channel_id: u32,
+    pub cycle_index: u16,
+    pub corrected_mode: DegradationMode,
+    pub notes: String,
+    pub operator: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 pub struct DegradationAnalysisService {
     config: DegradationConfig,
     baseline_data: std::collections::HashMap<(u16, u32), Vec<DvDqPoint>>,
     historical_analysis: std::collections::HashMap<(u16, u32), Vec<(u16, DegradationMode, f64)>>,
+    model_baselines: std::collections::HashMap<String, ModelBaseline>,
+    manual_labels: std::collections::HashMap<(u16, u32, u16), ManualLabel>,
+    pending_confirmation: std::collections::HashSet<(u16, u32, u16)>,
 }
 
 impl DegradationAnalysisService {
@@ -40,6 +78,9 @@ impl DegradationAnalysisService {
             config,
             baseline_data: std::collections::HashMap::new(),
             historical_analysis: std::collections::HashMap::new(),
+            model_baselines: std::collections::HashMap::new(),
+            manual_labels: std::collections::HashMap::new(),
+            pending_confirmation: std::collections::HashSet::new(),
         }
     }
 
@@ -51,6 +92,7 @@ impl DegradationAnalysisService {
         discharge_data: &[ChannelData],
         historical_capacities: &[(u16, f64)],
         historical_resistances: &[(u16, f64)],
+        battery_model: Option<String>,
     ) -> (DegradationAnalysis, Vec<DvDqPoint>) {
         let dvdq_curve = self.calculate_dvdq_curve(discharge_data);
 
@@ -58,13 +100,46 @@ impl DegradationAnalysisService {
         let peak_positions: Vec<f64> = peaks.iter().map(|(v, _)| *v).collect();
         let peak_heights: Vec<f64> = peaks.iter().map(|(_, h)| *h).collect();
 
+        let is_new_model = battery_model.as_ref()
+            .map(|m| !self.model_baselines.contains_key(m))
+            .unwrap_or(false);
+
+        let mut used_transfer_learning = false;
+        let mut transfer_source_model: Option<String> = None;
+        let mut transfer_similarity: Option<f64> = None;
+        let baseline_sample_count = battery_model.as_ref()
+            .and_then(|m| self.model_baselines.get(m))
+            .map(|b| b.sample_count)
+            .unwrap_or(0);
+
+        let effective_cathode_range = if is_new_model && self.config.enable_transfer_learning {
+            if let Some(source) = self.find_similar_baseline(&peak_positions, &peak_heights) {
+                used_transfer_learning = true;
+                transfer_source_model = Some(source.model_name.clone());
+                transfer_similarity = Some(self.calculate_model_similarity(&peaks, &source));
+                Some(source.cathode_peak_range)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let (cathode_score, anode_score, electrolyte_score, sei_score) =
-            self.calculate_degradation_scores(&dvdq_curve, &peaks, cabinet_id, channel_id, cycle_index);
+            self.calculate_degradation_scores_with_transfer(
+                &dvdq_curve,
+                &peaks,
+                cabinet_id,
+                channel_id,
+                cycle_index,
+                effective_cathode_range,
+                &battery_model,
+            );
 
         let capacity_fade_rate = self.calculate_fade_rate(historical_capacities);
         let resistance_growth_rate = self.calculate_resistance_growth_rate(historical_resistances);
 
-        let (mode, confidence) = self.classify_degradation_mode(
+        let (mut mode, mut confidence) = self.classify_degradation_mode(
             cathode_score,
             anode_score,
             electrolyte_score,
@@ -73,7 +148,35 @@ impl DegradationAnalysisService {
             resistance_growth_rate,
         );
 
-        let recommendations = self.generate_recommendations(mode, confidence, capacity_fade_rate);
+        if is_new_model {
+            confidence *= 1.0 - self.config.new_model_confidence_penalty;
+        }
+        if used_transfer_learning {
+            confidence = confidence * (1.0 - self.config.transfer_learning_weight) 
+                + self.config.transfer_learning_weight * transfer_similarity.unwrap_or(0.5);
+        }
+
+        let key_label = (cabinet_id, channel_id, cycle_index);
+        if let Some(label) = self.manual_labels.get(&key_label) {
+            mode = label.corrected_mode;
+            confidence = 0.95;
+        }
+
+        let requires_manual_confirmation = confidence < self.config.require_manual_confirmation_threshold
+            || is_new_model
+            || (used_transfer_learning && transfer_similarity.unwrap_or(0.0) < 0.7);
+
+        if requires_manual_confirmation {
+            self.pending_confirmation.insert(key_label);
+        }
+
+        let recommendations = self.generate_recommendations_with_context(
+            mode,
+            confidence,
+            capacity_fade_rate,
+            is_new_model,
+            used_transfer_learning,
+        );
 
         let analysis = DegradationAnalysis {
             timestamp: Utc::now(),
@@ -91,6 +194,17 @@ impl DegradationAnalysisService {
             capacity_fade_rate,
             resistance_growth_rate,
             recommendations,
+            battery_model: battery_model.clone(),
+            used_transfer_learning,
+            transfer_source_model,
+            transfer_similarity,
+            baseline_sample_count,
+            requires_manual_confirmation,
+            is_new_model,
+            manually_corrected_mode: self.manual_labels.get(&key_label).map(|l| l.corrected_mode),
+            correction_notes: self.manual_labels.get(&key_label).map(|l| l.notes.clone()),
+            corrected_by: self.manual_labels.get(&key_label).map(|l| l.operator.clone()),
+            corrected_at: self.manual_labels.get(&key_label).map(|l| l.timestamp),
         };
 
         let key = (cabinet_id, channel_id);
@@ -101,6 +215,9 @@ impl DegradationAnalysisService {
 
         if cycle_index == self.config.reference_cycle {
             self.baseline_data.insert(key, dvdq_curve.clone());
+            if let Some(model) = &battery_model {
+                self.update_model_baseline(model, &dvdq_curve, &peaks);
+            }
         }
 
         (analysis, dvdq_curve)
@@ -207,20 +324,356 @@ impl DegradationAnalysisService {
         channel_id: u32,
         cycle_index: u16,
     ) -> (f64, f64, f64, f64) {
+        self.calculate_degradation_scores_with_transfer(
+            current_curve,
+            current_peaks,
+            cabinet_id,
+            channel_id,
+            cycle_index,
+            None,
+            &None,
+        )
+    }
+
+    fn calculate_degradation_scores_with_transfer(
+        &self,
+        current_curve: &[DvDqPoint],
+        current_peaks: &[(f64, f64)],
+        cabinet_id: u16,
+        channel_id: u32,
+        cycle_index: u16,
+        transfer_cathode_range: Option<(f64, f64)>,
+        battery_model: &Option<String>,
+    ) -> (f64, f64, f64, f64) {
         let key = (cabinet_id, channel_id);
         let baseline = self.baseline_data.get(&key);
+        let model_baseline = battery_model.as_ref().and_then(|m| self.model_baselines.get(m));
 
-        match baseline {
-            None => (0.5, 0.5, 0.5, 0.5),
-            Some(baseline_curve) => {
-                let cathode_score = self.calculate_cathode_score(current_peaks, baseline_curve, cycle_index);
-                let anode_score = self.calculate_anode_score(current_peaks, baseline_curve, cycle_index);
+        let cathode_range = transfer_cathode_range
+            .or_else(|| model_baseline.map(|b| b.cathode_peak_range))
+            .unwrap_or(self.config.cathode_peak_range);
+
+        let anode_range = model_baseline
+            .map(|b| b.anode_peak_range)
+            .unwrap_or(self.config.anode_peak_range);
+
+        let sei_range = model_baseline
+            .map(|b| b.sei_peak_range)
+            .unwrap_or(self.config.sei_peak_range);
+
+        match (baseline, model_baseline) {
+            (None, None) => (0.5, 0.5, 0.5, 0.5),
+            (Some(baseline_curve), _) => {
+                let cathode_score = self.calculate_cathode_score_with_range(
+                    current_peaks, baseline_curve, cycle_index, cathode_range);
+                let anode_score = self.calculate_anode_score_with_range(
+                    current_peaks, baseline_curve, cycle_index, anode_range);
                 let electrolyte_score = self.calculate_electrolyte_score(current_curve, baseline_curve);
-                let sei_score = self.calculate_sei_score(current_peaks, cycle_index);
+                let sei_score = self.calculate_sei_score_with_range(
+                    current_peaks, cycle_index, sei_range);
+
+                (cathode_score, anode_score, electrolyte_score, sei_score)
+            }
+            (None, Some(model_bl)) => {
+                let cathode_score = self.calculate_cathode_score_with_range(
+                    current_peaks, &model_bl.avg_dvdq_curve, cycle_index, cathode_range);
+                let anode_score = self.calculate_anode_score_with_range(
+                    current_peaks, &model_bl.avg_dvdq_curve, cycle_index, anode_range);
+                let electrolyte_score = self.calculate_electrolyte_score(current_curve, &model_bl.avg_dvdq_curve);
+                let sei_score = self.calculate_sei_score_with_range(
+                    current_peaks, cycle_index, sei_range);
 
                 (cathode_score, anode_score, electrolyte_score, sei_score)
             }
         }
+    }
+
+    fn calculate_cathode_score_with_range(
+        &self,
+        peaks: &[(f64, f64)],
+        baseline: &[DvDqPoint],
+        cycle_index: u16,
+        range: (f64, f64),
+    ) -> f64 {
+        let (low, high) = range;
+
+        let cathode_peaks: Vec<&(f64, f64)> = peaks
+            .iter()
+            .filter(|(v, _)| *v >= low && *v <= high)
+            .collect();
+
+        if cathode_peaks.is_empty() {
+            return 0.3;
+        }
+
+        let baseline_cathode_peaks: Vec<&DvDqPoint> = baseline
+            .iter()
+            .filter(|p| p.voltage >= low && p.voltage <= high)
+            .collect();
+
+        if baseline_cathode_peaks.is_empty() {
+            return 0.5;
+        }
+
+        let baseline_avg_height: f64 = baseline_cathode_peaks.iter().map(|p| p.dq_dv).sum::<f64>()
+            / baseline_cathode_peaks.len() as f64;
+
+        let current_avg_height: f64 = cathode_peaks.iter().map(|(_, h)| *h).sum::<f64>()
+            / cathode_peaks.len() as f64;
+
+        let height_ratio = if baseline_avg_height > 0.0 {
+            current_avg_height / baseline_avg_height
+        } else {
+            1.0
+        };
+
+        let cycle_factor = (cycle_index as f64 / 100.0).min(1.0);
+        let attenuation_factor = (1.0 - height_ratio).abs();
+
+        1.0 - (attenuation_factor * cycle_factor).max(0.2)
+    }
+
+    fn calculate_anode_score_with_range(
+        &self,
+        peaks: &[(f64, f64)],
+        baseline: &[DvDqPoint],
+        cycle_index: u16,
+        range: (f64, f64),
+    ) -> f64 {
+        let (low, high) = range;
+        let anode_peaks: Vec<&(f64, f64)> = peaks
+            .iter()
+            .filter(|(v, _)| *v >= low && *v <= high)
+            .collect();
+
+        if anode_peaks.is_empty() {
+            return 0.3;
+        }
+
+        let baseline_anode_peaks: Vec<&DvDqPoint> = baseline
+            .iter()
+            .filter(|p| p.voltage >= low && p.voltage <= high)
+            .collect();
+
+        if baseline_anode_peaks.is_empty() {
+            return 0.5;
+        }
+
+        let baseline_avg_height: f64 = baseline_anode_peaks.iter().map(|p| p.dq_dv).sum::<f64>()
+            / baseline_anode_peaks.len() as f64;
+
+        let current_avg_height: f64 = anode_peaks.iter().map(|(_, h)| *h).sum::<f64>()
+            / anode_peaks.len() as f64;
+
+        let height_ratio = if baseline_avg_height > 0.0 {
+            current_avg_height / baseline_avg_height
+        } else {
+            1.0
+        };
+
+        let cycle_factor = (cycle_index as f64 / 100.0).min(1.0);
+        let attenuation_factor = (1.0 - height_ratio).abs();
+
+        1.0 - (attenuation_factor * cycle_factor).max(0.2)
+    }
+
+    fn calculate_sei_score_with_range(
+        &self,
+        peaks: &[(f64, f64)],
+        cycle_index: u16,
+        range: (f64, f64),
+    ) -> f64 {
+        let (low, high) = range;
+        let sei_peaks: Vec<&(f64, f64)> = peaks
+            .iter()
+            .filter(|(v, _)| *v >= low && *v <= high)
+            .collect();
+
+        if sei_peaks.is_empty() || cycle_index < 10 {
+            return 0.2;
+        }
+
+        let max_height: f64 = sei_peaks.iter().map(|(_, h)| *h).fold(f64::NEG_INFINITY, f64::max);
+        let cycle_factor = (cycle_index as f64 / 50.0).min(1.0);
+        let growth_factor = (max_height - 0.5).max(0.0) * cycle_factor;
+
+        (0.5 + growth_factor).min(0.95)
+    }
+
+    fn find_similar_baseline(
+        &self,
+        peak_positions: &[f64],
+        peak_heights: &[f64],
+    ) -> Option<&ModelBaseline> {
+        if self.model_baselines.is_empty() {
+            return None;
+        }
+
+        let mut best_match: Option<&ModelBaseline> = None;
+        let mut best_similarity = 0.0;
+
+        for baseline in self.model_baselines.values() {
+            let similarity = self.calculate_peak_similarity(peak_positions, peak_heights, &baseline.peak_positions);
+            
+            if similarity > best_similarity && similarity >= self.config.max_transfer_distance {
+                best_similarity = similarity;
+                best_match = Some(baseline);
+            }
+        }
+
+        best_match
+    }
+
+    fn calculate_peak_similarity(
+        &self,
+        positions1: &[f64],
+        heights1: &[f64],
+        positions2: &[f64],
+    ) -> f64 {
+        if positions1.is_empty() || positions2.is_empty() {
+            return 0.0;
+        }
+
+        let mut matches = 0;
+        for &p1 in positions1 {
+            for &p2 in positions2 {
+                if (p1 - p2).abs() < 0.2 {
+                    matches += 1;
+                    break;
+                }
+            }
+        }
+
+        let position_score = matches as f64 / positions1.len() as f64;
+
+        let avg_h1: f64 = heights1.iter().sum::<f64>() / heights1.len() as f64;
+        let avg_h2: f64 = if !positions2.is_empty() {
+            positions2.len() as f64 / positions2.len() as f64
+        } else { 0.5 };
+
+        let height_score = 1.0 - (avg_h1 - avg_h2).abs().min(1.0);
+
+        position_score * 0.7 + height_score * 0.3
+    }
+
+    fn calculate_model_similarity(
+        &self,
+        peaks: &[(f64, f64)],
+        baseline: &ModelBaseline,
+    ) -> f64 {
+        let peak_positions: Vec<f64> = peaks.iter().map(|(v, _)| *v).collect();
+        let peak_heights: Vec<f64> = peaks.iter().map(|(_, h)| *h).collect();
+        self.calculate_peak_similarity(&peak_positions, &peak_heights, &baseline.peak_positions)
+    }
+
+    fn update_model_baseline(
+        &mut self,
+        model_name: &str,
+        dvdq_curve: &[DvDqPoint],
+        peaks: &[(f64, f64)],
+    ) {
+        let peak_positions: Vec<f64> = peaks.iter().map(|(v, _)| *v).collect();
+
+        let entry = self.model_baselines.entry(model_name.to_string())
+            .or_insert_with(|| ModelBaseline {
+                model_name: model_name.to_string(),
+                avg_dvdq_curve: Vec::new(),
+                peak_positions: Vec::new(),
+                sample_count: 0,
+                cathode_peak_range: self.config.cathode_peak_range,
+                anode_peak_range: self.config.anode_peak_range,
+                sei_peak_range: self.config.sei_peak_range,
+                model_features: Vec::new(),
+            });
+
+        entry.sample_count += 1;
+        entry.peak_positions = if entry.peak_positions.is_empty() {
+            peak_positions.clone()
+        } else {
+            let mut combined = entry.peak_positions.clone();
+            combined.extend(peak_positions.iter().cloned());
+            combined.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            combined.dedup_by(|a, b| (*a - *b).abs() < 0.1);
+            combined
+        };
+
+        if entry.sample_count >= self.config.min_baseline_samples {
+            if let Some(min_peak) = entry.peak_positions.iter().cloned().fold(f64::NEG_INFINITY, f64::max) {
+                entry.cathode_peak_range = (
+                    (min_peak - 0.2).max(3.6),
+                    (min_peak + 0.2).min(4.2),
+                );
+            }
+        }
+    }
+
+    fn generate_recommendations_with_context(
+        &self,
+        mode: DegradationMode,
+        confidence: f64,
+        fade_rate: f64,
+        is_new_model: bool,
+        used_transfer: bool,
+    ) -> String {
+        let mut recs = self.generate_recommendations(mode, confidence, fade_rate);
+
+        if is_new_model {
+            recs.push_str("\n⚠️ 新电池型号，基线数据不足，建议加强监测");
+        }
+        if used_transfer {
+            recs.push_str("\n🔄 使用迁移学习基线，请关注结果准确性");
+        }
+        if confidence < self.config.require_manual_confirmation_threshold {
+            recs.push_str("\n👤 建议人工审核确认分类结果");
+        }
+
+        recs
+    }
+
+    pub fn add_manual_label(
+        &mut self,
+        cabinet_id: u16,
+        channel_id: u32,
+        cycle_index: u16,
+        corrected_mode: DegradationMode,
+        notes: String,
+        operator: String,
+    ) -> bool {
+        let key = (cabinet_id, channel_id, cycle_index);
+        self.manual_labels.insert(key, ManualLabel {
+            cabinet_id,
+            channel_id,
+            cycle_index,
+            corrected_mode,
+            notes,
+            operator,
+            timestamp: Utc::now(),
+        });
+        self.pending_confirmation.remove(&key);
+        true
+    }
+
+    pub fn get_pending_confirmations(&self) -> Vec<(u16, u32, u16)> {
+        self.pending_confirmation
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_model_baseline_info(&self, model_name: &str) -> Option<&ModelBaseline> {
+        self.model_baselines.get(model_name)
+    }
+
+    pub fn list_known_models(&self) -> Vec<String> {
+        self.model_baselines.keys().cloned().collect()
+    }
+
+    pub fn register_model_baseline(
+        &mut self,
+        model_name: String,
+        baseline: ModelBaseline,
+    ) {
+        self.model_baselines.insert(model_name, baseline);
     }
 
     fn calculate_cathode_score(

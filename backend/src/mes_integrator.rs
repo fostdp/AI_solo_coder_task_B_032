@@ -1,5 +1,6 @@
 use crate::models::{BatchCapacityDistribution, BatchInfo, BatchQueryRequest, DegradedCellRecord, MesSyncResult, MesSyncStatus, ProcessParamRecord};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -12,6 +13,14 @@ pub struct MesConfig {
     pub retry_interval_seconds: u64,
     pub batch_size: usize,
     pub enable_automatic_sync: bool,
+    pub enable_offline_cache: bool,
+    pub offline_cache_path: String,
+    pub max_pending_records: usize,
+    pub backpressure_threshold: usize,
+    pub auto_recovery_enabled: bool,
+    pub max_batch_per_sync: usize,
+    pub health_check_interval: u64,
+    pub max_retry_delay_seconds: u64,
 }
 
 impl Default for MesConfig {
@@ -24,8 +33,23 @@ impl Default for MesConfig {
             retry_interval_seconds: 10,
             batch_size: 100,
             enable_automatic_sync: true,
+            enable_offline_cache: true,
+            offline_cache_path: "./data/mes_offline_cache".to_string(),
+            max_pending_records: 100000,
+            backpressure_threshold: 50000,
+            auto_recovery_enabled: true,
+            max_batch_per_sync: 10,
+            health_check_interval: 60,
+            max_retry_delay_seconds: 300,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineCacheHeader {
+    pub created_at: DateTime<Utc>,
+    pub record_count: usize,
+    pub data_type: String,
 }
 
 pub struct MesIntegrationService {
@@ -34,20 +58,72 @@ pub struct MesIntegrationService {
     pending_degraded: Vec<DegradedCellRecord>,
     sync_history: HashMap<String, MesSyncResult>,
     batch_info_cache: HashMap<String, BatchInfo>,
+    mes_available: bool,
+    last_health_check: Option<DateTime<Utc>>,
+    consecutive_failures: u32,
+    current_retry_delay: u64,
+    offline_cache_params: Vec<ProcessParamRecord>,
+    offline_cache_degraded: Vec<DegradedCellRecord>,
+    backpressure_active: bool,
+    total_backlogged: u64,
+    last_offline_flush: Option<DateTime<Utc>>,
 }
 
 impl MesIntegrationService {
     pub fn new(config: MesConfig) -> Self {
-        Self {
+        let mut service = Self {
             config,
             pending_params: Vec::new(),
             pending_degraded: Vec::new(),
             sync_history: HashMap::new(),
             batch_info_cache: HashMap::new(),
+            mes_available: true,
+            last_health_check: None,
+            consecutive_failures: 0,
+            current_retry_delay: 0,
+            offline_cache_params: Vec::new(),
+            offline_cache_degraded: Vec::new(),
+            backpressure_active: false,
+            total_backlogged: 0,
+            last_offline_flush: None,
+        };
+
+        if service.config.enable_offline_cache {
+            service.load_offline_cache();
         }
+
+        service
     }
 
-    pub fn record_process_param(&mut self, record: ProcessParamRecord) {
+    pub fn record_process_param(&mut self, mut record: ProcessParamRecord) {
+        self.check_health_and_recovery();
+
+        let total_pending = self.pending_params.len() + self.offline_cache_params.len();
+        
+        if total_pending >= self.config.backpressure_threshold {
+            self.backpressure_active = true;
+        }
+
+        if !self.mes_available || self.backpressure_active {
+            self.total_backlogged += 1;
+            
+            if self.config.enable_offline_cache {
+                record.mes_sync_status = MesSyncStatus::CachedOffline;
+                self.offline_cache_params.push(record);
+                
+                if self.offline_cache_params.len() % 1000 == 0 {
+                    let _ = self.flush_offline_cache();
+                }
+            } else {
+                self.pending_params.push(record);
+            }
+            return;
+        }
+
+        if total_pending >= self.config.max_pending_records {
+            self.discard_oldest_records(1000);
+        }
+
         self.pending_params.push(record);
 
         if self.config.enable_automatic_sync && self.pending_params.len() >= self.config.batch_size {
@@ -55,7 +131,31 @@ impl MesIntegrationService {
         }
     }
 
-    pub fn record_degraded_cell(&mut self, record: DegradedCellRecord) {
+    pub fn record_degraded_cell(&mut self, mut record: DegradedCellRecord) {
+        self.check_health_and_recovery();
+
+        let total_pending = self.pending_degraded.len() + self.offline_cache_degraded.len();
+
+        if !self.mes_available || self.backpressure_active {
+            self.total_backlogged += 1;
+            
+            if self.config.enable_offline_cache {
+                record.mes_sync_status = MesSyncStatus::CachedOffline;
+                self.offline_cache_degraded.push(record);
+                
+                if self.offline_cache_degraded.len() % 500 == 0 {
+                    let _ = self.flush_offline_cache();
+                }
+            } else {
+                self.pending_degraded.push(record);
+            }
+            return;
+        }
+
+        if total_pending >= self.config.max_pending_records / 2 {
+            self.discard_oldest_degraded(500);
+        }
+
         self.pending_degraded.push(record);
 
         if self.config.enable_automatic_sync && self.pending_degraded.len() >= self.config.batch_size / 2 {
@@ -64,7 +164,14 @@ impl MesIntegrationService {
     }
 
     pub fn sync_process_params(&mut self) -> Result<MesSyncResult, String> {
-        if self.pending_params.is_empty() {
+        if self.offline_cache_params.len() > 0 && self.mes_available && self.config.auto_recovery_enabled {
+            let recovery_result = self.recover_from_offline_cache();
+            if let Err(e) = recovery_result {
+                eprintln!("Warning: Failed to recover offline cache: {}", e);
+            }
+        }
+
+        if self.pending_params.is_empty() && self.offline_cache_params.is_empty() {
             return Ok(MesSyncResult {
                 batch_id: "NONE".to_string(),
                 total_records: 0,
@@ -75,47 +182,100 @@ impl MesIntegrationService {
             });
         }
 
+        let mut records_to_sync: Vec<ProcessParamRecord> = Vec::new();
+        let transfer_count = self.offline_cache_params.len().min(self.config.batch_size * self.config.max_batch_per_sync);
+        if transfer_count > 0 {
+            records_to_sync.extend(self.offline_cache_params.drain(0..transfer_count));
+        }
+        let live_count = self.pending_params.len().min(self.config.batch_size - records_to_sync.len());
+        if live_count > 0 {
+            records_to_sync.extend(self.pending_params.drain(0..live_count));
+        }
+
         let start_time = std::time::Instant::now();
-        let batch_id = self.pending_params.first().map(|p| p.batch_id.clone()).unwrap_or_default();
-        let total_records = self.pending_params.len();
+        let batch_id = records_to_sync.first().map(|p| p.batch_id.clone()).unwrap_or_default();
+        let total_records = records_to_sync.len();
+        
+        let mut synced_records = 0;
+        let mut failed_records = 0;
+        let mut error_messages: Vec<String> = Vec::new();
 
-        let mut synced = 0;
-        let mut failed = 0;
-        let mut errors = Vec::new();
-
-        for record in self.pending_params.iter_mut() {
-            match self.send_param_to_mes(record) {
+        for chunk in records_to_sync.chunks(self.config.batch_size) {
+            let mut chunk_records: Vec<ProcessParamRecord> = chunk.to_vec();
+            match self.send_batch_to_mes(&chunk_records, "params") {
                 Ok(_) => {
-                    record.mes_sync_status = MesSyncStatus::Synced;
-                    record.mes_sync_time = Some(Utc::now());
-                    synced += 1;
+                    synced_records += chunk.len();
+                    for r in &mut chunk_records {
+                        r.mes_sync_status = MesSyncStatus::Synced;
+                        r.mes_sync_time = Some(Utc::now());
+                    }
                 }
                 Err(e) => {
-                    record.mes_sync_status = MesSyncStatus::Failed;
-                    errors.push(format!("通道{}: {}", record.channel_id, e));
-                    failed += 1;
+                    failed_records += chunk.len();
+                    error_messages.push(e.clone());
+                    
+                    self.consecutive_failures += 1;
+                    if self.consecutive_failures >= self.config.retry_count {
+                        self.mes_available = false;
+                        self.current_retry_delay = self.config.retry_interval_seconds
+                            * 2u64.pow(self.consecutive_failures.min(5))
+                            .min(self.config.max_retry_delay_seconds);
+                        
+                        for r in chunk_records {
+                            let mut record = r.clone();
+                            record.mes_sync_status = MesSyncStatus::Failed;
+                            record.mes_error_message = e.clone();
+                            self.offline_cache_params.push(record);
+                        }
+                        break;
+                    }
+                    
+                    for r in chunk_records {
+                        let mut record = r.clone();
+                        record.mes_sync_status = MesSyncStatus::Failed;
+                        record.mes_error_message = e.clone();
+                        self.pending_params.push(record);
+                    }
                 }
             }
         }
 
+        if synced_records > 0 {
+            self.consecutive_failures = 0;
+            self.mes_available = true;
+            self.current_retry_delay = 0;
+            
+            if self.backpressure_active {
+                let total_pending = self.pending_params.len() + self.offline_cache_params.len();
+                if total_pending < self.config.backpressure_threshold / 2 {
+                    self.backpressure_active = false;
+                }
+            }
+        }
+
+        let sync_time_ms = start_time.elapsed().as_millis() as u64;
+
         let result = MesSyncResult {
             batch_id: batch_id.clone(),
             total_records,
-            synced_records: synced,
-            failed_records: failed,
-            error_messages: errors,
-            sync_time_ms: start_time.elapsed().as_millis() as u64,
+            synced_records,
+            failed_records,
+            error_messages,
+            sync_time_ms,
         };
 
         self.sync_history.insert(format!("params_{}", batch_id), result.clone());
+        self.last_health_check = Some(Utc::now());
 
-        self.pending_params.retain(|r| r.mes_sync_status == MesSyncStatus::Failed);
-
-        Ok(result)
+        if failed_records > 0 {
+            Err(format!("Failed to sync {} records", failed_records))
+        } else {
+            Ok(result)
+        }
     }
 
     pub fn sync_degraded_cells(&mut self) -> Result<MesSyncResult, String> {
-        if self.pending_degraded.is_empty() {
+        if self.pending_degraded.is_empty() && self.offline_cache_degraded.is_empty() {
             return Ok(MesSyncResult {
                 batch_id: "NONE".to_string(),
                 total_records: 0,
@@ -126,43 +286,80 @@ impl MesIntegrationService {
             });
         }
 
+        let mut records_to_sync: Vec<DegradedCellRecord> = Vec::new();
+        let transfer_count = self.offline_cache_degraded.len().min(self.config.batch_size * self.config.max_batch_per_sync / 2);
+        if transfer_count > 0 {
+            records_to_sync.extend(self.offline_cache_degraded.drain(0..transfer_count));
+        }
+        let live_count = self.pending_degraded.len().min(self.config.batch_size / 2 - records_to_sync.len());
+        if live_count > 0 {
+            records_to_sync.extend(self.pending_degraded.drain(0..live_count));
+        }
+
         let start_time = std::time::Instant::now();
-        let batch_id = self.pending_degraded.first().map(|p| p.batch_id.clone()).unwrap_or_default();
-        let total_records = self.pending_degraded.len();
+        let batch_id = records_to_sync.first().map(|p| p.batch_id.clone()).unwrap_or_default();
+        let total_records = records_to_sync.len();
 
-        let mut synced = 0;
-        let mut failed = 0;
-        let mut errors = Vec::new();
+        let mut synced_records = 0;
+        let mut failed_records = 0;
+        let mut error_messages: Vec<String> = Vec::new();
 
-        for record in self.pending_degraded.iter_mut() {
-            match self.send_degraded_cell_to_mes(record) {
+        for chunk in records_to_sync.chunks(self.config.batch_size / 2) {
+            let mut chunk_records: Vec<DegradedCellRecord> = chunk.to_vec();
+            match self.send_batch_to_mes(&chunk_records, "degraded") {
                 Ok(_) => {
-                    record.mes_sync_status = MesSyncStatus::Synced;
-                    record.mes_sync_time = Some(Utc::now());
-                    synced += 1;
+                    synced_records += chunk.len();
+                    for r in &mut chunk_records {
+                        r.mes_sync_status = MesSyncStatus::Synced;
+                        r.mes_sync_time = Some(Utc::now());
+                    }
                 }
                 Err(e) => {
-                    record.mes_sync_status = MesSyncStatus::Failed;
-                    errors.push(format!("通道{}: {}", record.channel_id, e));
-                    failed += 1;
+                    failed_records += chunk.len();
+                    error_messages.push(e.clone());
+
+                    for r in chunk_records {
+                        let mut record = r.clone();
+                        record.mes_sync_status = MesSyncStatus::Failed;
+                        record.mes_error_message = e.clone();
+                        self.offline_cache_degraded.push(record);
+                    }
                 }
             }
         }
 
+        if synced_records > 0 {
+            self.consecutive_failures = 0;
+            self.mes_available = true;
+            self.current_retry_delay = 0;
+
+            if self.backpressure_active {
+                let total_pending = self.pending_degraded.len() + self.offline_cache_degraded.len();
+                if total_pending < self.config.backpressure_threshold / 4 {
+                    self.backpressure_active = false;
+                }
+            }
+        }
+
+        let sync_time_ms = start_time.elapsed().as_millis() as u64;
+
         let result = MesSyncResult {
             batch_id: batch_id.clone(),
             total_records,
-            synced_records: synced,
-            failed_records: failed,
-            error_messages: errors,
-            sync_time_ms: start_time.elapsed().as_millis() as u64,
+            synced_records,
+            failed_records,
+            error_messages,
+            sync_time_ms,
         };
 
         self.sync_history.insert(format!("degraded_{}", batch_id), result.clone());
+        self.last_health_check = Some(Utc::now());
 
-        self.pending_degraded.retain(|r| r.mes_sync_status == MesSyncStatus::Failed);
-
-        Ok(result)
+        if failed_records > 0 {
+            Err(format!("Failed to sync {} records", failed_records))
+        } else {
+            Ok(result)
+        }
     }
 
     pub fn sync_batch_summary(&mut self, batch_info: &BatchInfo) -> Result<MesSyncResult, String> {
@@ -592,6 +789,222 @@ impl MesIntegrationService {
         let mut batches: Vec<&BatchInfo> = self.batch_info_cache.values().collect();
         batches.sort_by(|a, b| b.start_time.cmp(&a.start_time));
         batches
+    }
+
+    fn check_health_and_recovery(&mut self) {
+        let now = Utc::now();
+        
+        if let Some(last_check) = self.last_health_check {
+            let elapsed = (now - last_check).num_seconds() as u64;
+            if elapsed < self.config.health_check_interval {
+                return;
+            }
+        }
+
+        self.last_health_check = Some(now);
+
+        if !self.mes_available && self.config.auto_recovery_enabled {
+            if self.current_retry_delay == 0 {
+                self.current_retry_delay = self.config.retry_interval_seconds;
+            }
+
+            let elapsed = self.last_health_check
+                .map(|t| (now - t).num_seconds() as u64)
+                .unwrap_or(0);
+
+            if elapsed >= self.current_retry_delay {
+                if self.ping_mes() {
+                    self.mes_available = true;
+                    self.consecutive_failures = 0;
+                    self.current_retry_delay = 0;
+                    let _ = self.flush_offline_cache();
+                } else {
+                    self.current_retry_delay = (self.current_retry_delay * 2)
+                        .min(self.config.max_retry_delay_seconds);
+                }
+            }
+        }
+
+        if self.backpressure_active && self.mes_available {
+            let total_pending = self.pending_params.len() + self.offline_cache_params.len()
+                + self.pending_degraded.len() + self.offline_cache_degraded.len();
+            if total_pending < self.config.backpressure_threshold / 2 {
+                self.backpressure_active = false;
+            }
+        }
+    }
+
+    fn ping_mes(&self) -> bool {
+        if self.config.mes_api_url.is_empty() {
+            return true;
+        }
+        true
+    }
+
+    fn send_batch_to_mes<T: serde::Serialize>(&self, records: &[T], data_type: &str) -> Result<(), String> {
+        if !self.mes_available {
+            return Err(format!("MES system unavailable, {} records cached", records.len()));
+        }
+        Ok(())
+    }
+
+    fn flush_offline_cache(&mut self) -> Result<(), String> {
+        if !self.config.enable_offline_cache {
+            return Ok(());
+        }
+
+        let path = std::path::Path::new(&self.config.offline_cache_path);
+        if let Err(e) = std::fs::create_dir_all(path) {
+            return Err(format!("Failed to create cache directory: {}", e));
+        }
+
+        let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        
+        if !self.offline_cache_params.is_empty() {
+            let file_path = path.join(format!("params_{}.json", timestamp));
+            let header = OfflineCacheHeader {
+                created_at: Utc::now(),
+                record_count: self.offline_cache_params.len(),
+                data_type: "params".to_string(),
+            };
+            if let Ok(contents) = serde_json::to_string(&(&header, &self.offline_cache_params)) {
+                let _ = std::fs::write(file_path, contents);
+            }
+        }
+
+        if !self.offline_cache_degraded.is_empty() {
+            let file_path = path.join(format!("degraded_{}.json", timestamp));
+            let header = OfflineCacheHeader {
+                created_at: Utc::now(),
+                record_count: self.offline_cache_degraded.len(),
+                data_type: "degraded".to_string(),
+            };
+            if let Ok(contents) = serde_json::to_string(&(&header, &self.offline_cache_degraded)) {
+                let _ = std::fs::write(file_path, contents);
+            }
+        }
+
+        self.last_offline_flush = Some(Utc::now());
+        Ok(())
+    }
+
+    fn load_offline_cache(&mut self) {
+        let path = std::path::Path::new(&self.config.offline_cache_path);
+        if !path.exists() {
+            return;
+        }
+
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let file_path = entry.path();
+                if let Ok(contents) = std::fs::read_to_string(&file_path) {
+                    if file_path.to_string_lossy().contains("params") {
+                        if let Ok((_, records)) = serde_json::from_str::<(OfflineCacheHeader, Vec<ProcessParamRecord>)>(&contents) {
+                            self.offline_cache_params.extend(records);
+                        }
+                    } else if file_path.to_string_lossy().contains("degraded") {
+                        if let Ok((_, records)) = serde_json::from_str::<(OfflineCacheHeader, Vec<DegradedCellRecord>)>(&contents) {
+                            self.offline_cache_degraded.extend(records);
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(file_path);
+            }
+        }
+    }
+
+    fn recover_from_offline_cache(&mut self) -> Result<(), String> {
+        if !self.mes_available {
+            return Err("MES system unavailable".to_string());
+        }
+
+        let mut recovered = 0;
+        let mut failed = 0;
+
+        let param_count = self.offline_cache_params.len().min(self.config.batch_size * self.config.max_batch_per_sync);
+        if param_count > 0 {
+            let records: Vec<ProcessParamRecord> = self.offline_cache_params.drain(0..param_count).collect();
+            for chunk in records.chunks(self.config.batch_size) {
+                match self.send_batch_to_mes(chunk, "params") {
+                    Ok(_) => recovered += chunk.len(),
+                    Err(_) => {
+                        failed += chunk.len();
+                        self.offline_cache_params.extend(chunk.iter().cloned());
+                        break;
+                    }
+                }
+            }
+        }
+
+        let degraded_count = self.offline_cache_degraded.len().min(self.config.batch_size * self.config.max_batch_per_sync / 2);
+        if degraded_count > 0 {
+            let records: Vec<DegradedCellRecord> = self.offline_cache_degraded.drain(0..degraded_count).collect();
+            for chunk in records.chunks(self.config.batch_size / 2) {
+                match self.send_batch_to_mes(chunk, "degraded") {
+                    Ok(_) => recovered += chunk.len(),
+                    Err(_) => {
+                        failed += chunk.len();
+                        self.offline_cache_degraded.extend(chunk.iter().cloned());
+                        break;
+                    }
+                }
+            }
+        }
+
+        if failed > 0 {
+            Err(format!("Recovered {} records, {} failed", recovered, failed))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn discard_oldest_records(&mut self, count: usize) {
+        let discard = count.min(self.pending_params.len());
+        if discard > 0 {
+            self.pending_params.drain(0..discard);
+        }
+        
+        let discard_offline = (count - discard).min(self.offline_cache_params.len());
+        if discard_offline > 0 {
+            self.offline_cache_params.drain(0..discard_offline);
+        }
+    }
+
+    fn discard_oldest_degraded(&mut self, count: usize) {
+        let discard = count.min(self.pending_degraded.len());
+        if discard > 0 {
+            self.pending_degraded.drain(0..discard);
+        }
+        
+        let discard_offline = (count - discard).min(self.offline_cache_degraded.len());
+        if discard_offline > 0 {
+            self.offline_cache_degraded.drain(0..discard_offline);
+        }
+    }
+
+    pub fn get_mes_status(&self) -> (bool, u32, usize, usize, usize, usize) {
+        (
+            self.mes_available,
+            self.consecutive_failures,
+            self.pending_params.len(),
+            self.pending_degraded.len(),
+            self.offline_cache_params.len(),
+            self.offline_cache_degraded.len(),
+        )
+    }
+
+    pub fn trigger_manual_recovery(&mut self) -> Result<(usize, usize), String> {
+        if self.ping_mes() {
+            self.mes_available = true;
+            self.consecutive_failures = 0;
+            self.current_retry_delay = 0;
+            let params_count = self.offline_cache_params.len();
+            let degraded_count = self.offline_cache_degraded.len();
+            let _ = self.recover_from_offline_cache();
+            Ok((params_count, degraded_count))
+        } else {
+            Err("MES system still unavailable".to_string())
+        }
     }
 }
 
